@@ -82,6 +82,7 @@ pub enum EscrowError {
     BelowReputationThreshold = 30,
     InvalidPanel = 31,
     PanelRequired = 32,
+    RoleUnchanged = 33,
 }
 
 #[contracttype]
@@ -160,6 +161,14 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// Delegated operational roles. The admin implicitly holds every role.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    Pauser,
+    Resolver,
+}
+
 /// Admin-managed arbiter panel that settles high-value disputes by M-of-N vote.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +229,7 @@ enum DataKey {
     RatingWeight(u64),
     Panel,
     Votes(u64),
+    RoleMember(Role, Address),
 }
 
 #[contract]
@@ -236,6 +246,38 @@ fn require_admin(env: &Env) -> Result<Address, EscrowError> {
     let a = admin(env)?;
     a.require_auth();
     Ok(a)
+}
+
+fn holds_role(env: &Env, role: Role, account: &Address) -> bool {
+    if let Ok(admin_addr) = admin(env) {
+        if admin_addr == *account {
+            return true;
+        }
+    }
+    env.storage()
+        .persistent()
+        .get::<_, bool>(&DataKey::RoleMember(role, account.clone()))
+        .unwrap_or(false)
+}
+
+fn set_role(env: &Env, role: Role, account: Address, member: bool) -> Result<(), EscrowError> {
+    require_admin(env)?;
+    let key = DataKey::RoleMember(role, account.clone());
+    let current = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false);
+    if current == member {
+        return Err(EscrowError::RoleUnchanged);
+    }
+    env.storage().persistent().set(&key, &member);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    env.events()
+        .publish((symbol_short!("role_set"), role), (account, member));
+    Ok(())
 }
 
 fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
@@ -704,8 +746,12 @@ impl Escrow {
         admin(&env)
     }
 
-    pub fn set_paused(env: Env, paused: bool) -> Result<(), EscrowError> {
-        require_admin(&env)?;
+    /// Circuit breaker. Caller must be the admin or hold the `Pauser` role.
+    pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), EscrowError> {
+        caller.require_auth();
+        if !holds_role(&env, Role::Pauser, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
         env.storage().instance().set(&DataKey::Paused, &paused);
         bump_instance(&env);
         env.events().publish((symbol_short!("paused"),), paused);
@@ -1178,7 +1224,8 @@ impl Escrow {
         Ok(())
     }
 
-    /// Admin resolves a dispute, paying `freelancer_bps` (0..=10000) of the escrowed
+    /// Resolves a dispute (caller must be the admin or hold the `Resolver` role and
+    /// must not be a party to the escrow), paying `freelancer_bps` (0..=10000) of the escrowed
     /// balance to the freelancer and refunding the rest to the client.
     ///
     /// Outcomes:
@@ -1188,11 +1235,22 @@ impl Escrow {
     /// Note: this operation remains allowed even when the escrow is frozen.
     /// Escrows at or above `PANEL_THRESHOLD_AMOUNT` must be settled by the
     /// arbiter panel instead and return `PanelRequired`.
-    pub fn resolve_dispute(env: Env, id: u64, freelancer_bps: u32) -> Result<(), EscrowError> {
-        require_admin(&env)?;
+    pub fn resolve_dispute(
+        env: Env,
+        caller: Address,
+        id: u64,
+        freelancer_bps: u32,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        if !holds_role(&env, Role::Resolver, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
         let c = load(&env, id)?;
         if c.status != ContractStatus::Disputed {
             return Err(EscrowError::InvalidStatus);
+        }
+        if caller == c.client || caller == c.freelancer {
+            return Err(EscrowError::Unauthorized);
         }
         if c.total_amount >= PANEL_THRESHOLD_AMOUNT {
             return Err(EscrowError::PanelRequired);
@@ -1670,6 +1728,21 @@ impl Escrow {
             .persistent()
             .get(&DataKey::WeightedRep(freelancer))?;
         reputation_score(w.weighted_rating_sum, w.weight_total)
+    }
+
+    /// Grant a role to an account. Admin only; `RoleUnchanged` if already a member.
+    pub fn grant_role(env: Env, role: Role, account: Address) -> Result<(), EscrowError> {
+        set_role(&env, role, account, true)
+    }
+
+    /// Revoke a role from an account. Admin only; `RoleUnchanged` if not a member.
+    pub fn revoke_role(env: Env, role: Role, account: Address) -> Result<(), EscrowError> {
+        set_role(&env, role, account, false)
+    }
+
+    /// Role membership read; the admin implicitly holds every role.
+    pub fn has_role(env: Env, role: Role, account: Address) -> bool {
+        holds_role(&env, role, &account)
     }
 
     /// Returns the current arbiter panel, if one has been set.

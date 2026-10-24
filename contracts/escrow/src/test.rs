@@ -105,7 +105,7 @@ fn dispute_split_and_cancel() {
     );
     s.escrow.deposit_funds(&id, &(400 * U));
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &2_500);
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500);
     assert_eq!(s.token.balance(&s.freelancer), 100 * U);
     assert_eq!(s.token.balance(&s.client), 900 * U);
 
@@ -127,7 +127,7 @@ fn dispute_split_and_cancel() {
 #[test]
 fn pause_blocks_mutations() {
     let s = setup();
-    s.escrow.set_paused(&true);
+    s.escrow.set_paused(&s.admin, &true);
     assert_eq!(
         s.escrow.try_create_contract(
             &s.client,
@@ -152,7 +152,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id1, &(200 * U));
     s.escrow.open_dispute(&id1, &s.client);
-    s.escrow.resolve_dispute(&id1, &7_500);
+    s.escrow.resolve_dispute(&s.admin, &id1, &7_500);
 
     let client_outcomes1 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes1 = s.escrow.get_outcomes(&s.freelancer);
@@ -172,7 +172,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id2, &(200 * U));
     s.escrow.open_dispute(&id2, &s.freelancer);
-    s.escrow.resolve_dispute(&id2, &2_000);
+    s.escrow.resolve_dispute(&s.admin, &id2, &2_000);
 
     let client_outcomes2 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes2 = s.escrow.get_outcomes(&s.freelancer);
@@ -192,7 +192,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id3, &(200 * U));
     s.escrow.open_dispute(&id3, &s.client);
-    s.escrow.resolve_dispute(&id3, &5_000);
+    s.escrow.resolve_dispute(&s.admin, &id3, &5_000);
 
     let client_outcomes3 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes3 = s.escrow.get_outcomes(&s.freelancer);
@@ -217,7 +217,7 @@ fn rate_resolved_escrow_succeeds_once_and_cancelled_rejected() {
     );
     s.escrow.deposit_funds(&id, &(100 * U));
     s.escrow.open_dispute(&id, &s.client);
-    s.escrow.resolve_dispute(&id, &5_000);
+    s.escrow.resolve_dispute(&s.admin, &id, &5_000);
 
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
 
@@ -651,7 +651,7 @@ fn randomized_lifecycle_property_test() {
                 }
                 3 => {
                     let bps = rng.next_bounded(12_000);
-                    s.escrow.try_resolve_dispute(&target_id, &bps)
+                    s.escrow.try_resolve_dispute(&s.admin, &target_id, &bps)
                 }
                 4 => s.escrow.try_cancel_contract(&target_id),
                 5 => {
@@ -851,7 +851,7 @@ fn bonus_blocked_when_paused() {
         &vec![&s.env, 100 * U],
     );
     s.escrow.deposit_funds(&id, &(100 * U));
-    s.escrow.set_paused(&true);
+    s.escrow.set_paused(&s.admin, &true);
     assert_eq!(
         s.escrow.try_pay_bonus(&id, &(10 * U)),
         Err(Ok(EscrowError::Paused))
@@ -1056,7 +1056,7 @@ fn resolve_dispute_credits_payout_address_not_freelancer() {
         s.escrow.try_set_payout_address(&id, &other),
         Err(Ok(EscrowError::InvalidStatus))
     );
-    s.escrow.resolve_dispute(&id, &10_000); // full share to freelancer side
+    s.escrow.resolve_dispute(&s.admin, &id, &10_000); // full share to freelancer side
 
     assert_eq!(s.token.balance(&payout_wallet), 100 * U);
     assert_eq!(s.token.balance(&s.freelancer), 0);
@@ -1252,7 +1252,7 @@ fn test_resolve_dispute_allowed_on_frozen_escrow() {
     assert!(s.escrow.is_frozen(&id));
 
     // Admin resolves dispute on frozen escrow (must succeed)
-    assert_eq!(s.escrow.try_resolve_dispute(&id, &2_500), Ok(Ok(())));
+    assert_eq!(s.escrow.try_resolve_dispute(&s.admin, &id, &2_500), Ok(Ok(())));
     assert_eq!(s.token.balance(&s.freelancer), 100 * U);
     assert_eq!(s.token.balance(&s.client), 900 * U);
 }
@@ -1538,7 +1538,7 @@ fn compact_resolved_escrow() {
     );
     s.escrow.deposit_funds(&id, &(400 * U));
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &2_500); // 25% to freelancer
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500); // 25% to freelancer
 
     // Resolved escrows can still be rated, so compaction waits for the rating
     assert_eq!(
@@ -1831,7 +1831,7 @@ fn compact_resolved_unrated_escrow_after_30_days() {
     );
     s.escrow.deposit_funds(&id, &(100 * U));
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &5_000);
+    s.escrow.resolve_dispute(&s.admin, &id, &5_000);
 
     s.env.ledger().set_sequence_number(THIRTY_DAYS_IN_LEDGERS - 1);
     assert_eq!(
@@ -1980,7 +1980,7 @@ fn dispute_freelancer_share_respects_team_split() {
     s.escrow.set_team_split(&id, &payees);
     s.escrow.deposit_funds(&id, &4_000_004);
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &2_500);
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500);
 
     // 25% of 4_000_004 is 1_000_001; the split floors to 500_000/300_000/200_000
     // and the lead gets the 1-unit remainder.
@@ -2180,7 +2180,7 @@ fn summary_after_cancel_and_resolve() {
     );
     s.escrow.deposit_funds(&resolved, &(400 * U));
     s.escrow.open_dispute(&resolved, &s.freelancer);
-    s.escrow.resolve_dispute(&resolved, &2_500);
+    s.escrow.resolve_dispute(&s.admin, &resolved, &2_500);
     assert_eq!(
         s.escrow.get_escrow_summary(&resolved),
         EscrowSummary {
@@ -2320,7 +2320,7 @@ fn test_rate_client_resolved_success() {
     );
     s.escrow.deposit_funds(&id, &(200 * U));
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &5_000);
+    s.escrow.resolve_dispute(&s.admin, &id, &5_000);
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
 
     // Freelancer rates client after dispute resolution
@@ -2563,14 +2563,14 @@ fn test_rate_client_pause_gate() {
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
 
     // Pause contract
-    s.escrow.set_paused(&true);
+    s.escrow.set_paused(&s.admin, &true);
     assert_eq!(
         s.escrow.try_rate_client(&id, &5),
         Err(Ok(EscrowError::Paused))
     );
 
     // Unpause contract and verify rating succeeds
-    s.escrow.set_paused(&false);
+    s.escrow.set_paused(&s.admin, &false);
     assert_eq!(s.escrow.try_rate_client(&id, &5), Ok(Ok(())));
     let rep = s.escrow.get_client_reputation(&s.client);
     assert_eq!(rep.completed_contracts, 1);
@@ -2885,7 +2885,7 @@ fn dust_release_rating_returns_below_threshold() {
     s.escrow.deposit_funds(&id, &(100 * U));
     s.escrow.open_dispute(&id, &s.client);
     // 1 bps of the held balance reaches the freelancer: far below the threshold
-    s.escrow.resolve_dispute(&id, &1);
+    s.escrow.resolve_dispute(&s.admin, &id, &1);
     assert!(s.escrow.get_contract(&id).released_amount < MIN_REPUTATION_VALUE);
     assert_eq!(
         s.escrow.try_issue_reputation(&id, &5),
@@ -3010,7 +3010,7 @@ fn panel_two_of_three_different_votes_do_not_settle_until_matching() {
     let id = disputed_high_value_escrow(&s, PANEL_THRESHOLD_AMOUNT);
     // A high-value escrow cannot be settled by a single admin call.
     assert_eq!(
-        s.escrow.try_resolve_dispute(&id, &5_000),
+        s.escrow.try_resolve_dispute(&s.admin, &id, &5_000),
         Err(Ok(EscrowError::PanelRequired))
     );
     // Two different splits do not settle.
@@ -3126,7 +3126,7 @@ fn below_threshold_escrow_still_settles_via_resolve_dispute() {
     );
     s.escrow.deposit_funds(&id, &(400 * U));
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &2_500);
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500);
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
     assert_eq!(s.token.balance(&s.freelancer), 100 * U);
     assert_eq!(s.token.balance(&s.client), 900 * U);
@@ -3189,4 +3189,191 @@ fn panel_settlement_records_outcomes_and_liability() {
     assert_eq!(s.escrow.get_liability(&s.token.address), 0);
     assert_eq!(s.escrow.get_outcomes(&s.freelancer).disputes_won, 1);
     assert_eq!(s.escrow.get_outcomes(&s.client).disputes_lost, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Pauser and resolver roles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pauser_can_pause_but_cannot_resolve_disputes() {
+    let s = setup();
+    let pauser = Address::generate(&s.env);
+    s.escrow.grant_role(&Role::Pauser, &pauser);
+    assert!(s.escrow.has_role(&Role::Pauser, &pauser));
+
+    s.escrow
+        .mock_auths(&[MockAuth {
+            address: &pauser,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "set_paused",
+                args: (&pauser, true).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .set_paused(&pauser, &true);
+    assert!(s.escrow.is_paused());
+
+    s.escrow
+        .mock_auths(&[MockAuth {
+            address: &pauser,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "set_paused",
+                args: (&pauser, false).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .set_paused(&pauser, &false);
+    assert!(!s.escrow.is_paused());
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.open_dispute(&id, &s.freelancer);
+
+    let result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &pauser,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "resolve_dispute",
+                args: (&pauser, id, 5_000u32).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_resolve_dispute(&pauser, &id, &5_000);
+    assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn resolver_can_resolve_but_cannot_pause() {
+    let s = setup();
+    let resolver = Address::generate(&s.env);
+    s.escrow.grant_role(&Role::Resolver, &resolver);
+    assert!(s.escrow.has_role(&Role::Resolver, &resolver));
+
+    let pause_result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &resolver,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "set_paused",
+                args: (&resolver, true).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_paused(&resolver, &true);
+    assert_eq!(pause_result, Err(Ok(EscrowError::Unauthorized)));
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.open_dispute(&id, &s.freelancer);
+
+    s.escrow
+        .mock_auths(&[MockAuth {
+            address: &resolver,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "resolve_dispute",
+                args: (&resolver, id, 10_000u32).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .resolve_dispute(&resolver, &id, &10_000);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+}
+
+#[test]
+fn revoking_pauser_role_takes_effect_immediately() {
+    let s = setup();
+    let pauser = Address::generate(&s.env);
+    s.escrow.grant_role(&Role::Pauser, &pauser);
+    s.escrow.revoke_role(&Role::Pauser, &pauser);
+    assert!(!s.escrow.has_role(&Role::Pauser, &pauser));
+
+    let result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &pauser,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "set_paused",
+                args: (&pauser, true).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_paused(&pauser, &true);
+    assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn resolver_who_is_a_party_cannot_resolve_that_escrow() {
+    let s = setup();
+    s.escrow.grant_role(&Role::Resolver, &s.client);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.open_dispute(&id, &s.freelancer);
+
+    let result = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &s.client,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "resolve_dispute",
+                args: (&s.client, id, 5_000u32).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_resolve_dispute(&s.client, &id, &5_000);
+    assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+}
+
+
+#[test]
+fn grant_and_revoke_role_unchanged_and_admin_only() {
+    let s = setup();
+    let account = Address::generate(&s.env);
+    assert!(s.escrow.has_role(&Role::Pauser, &s.admin));
+    assert!(s.escrow.has_role(&Role::Resolver, &s.admin));
+    assert!(!s.escrow.has_role(&Role::Pauser, &account));
+    assert_eq!(
+        s.escrow.try_revoke_role(&Role::Pauser, &account),
+        Err(Ok(EscrowError::RoleUnchanged))
+    );
+    s.escrow.grant_role(&Role::Pauser, &account);
+    assert_eq!(
+        s.escrow.try_grant_role(&Role::Pauser, &account),
+        Err(Ok(EscrowError::RoleUnchanged))
+    );
+    // Roles are independent
+    assert!(!s.escrow.has_role(&Role::Resolver, &account));
+    // A role holder cannot grant roles: without the admin's signature it fails
+    s.env.mock_auths(&[]);
+    assert!(s
+        .escrow
+        .try_grant_role(&Role::Resolver, &account)
+        .is_err());
+    s.env.mock_all_auths();
+    assert!(!s.escrow.has_role(&Role::Resolver, &account));
 }

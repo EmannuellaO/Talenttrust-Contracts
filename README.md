@@ -36,7 +36,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `release_milestones(id, indices) -> i128` | client | Release several milestones in one call (all-or-nothing, one payout, one save); emits a `release` event per milestone plus `("rel_batch", id) -> (count, total)`; `DuplicateIndex` (`29`) on repeated indices |
 | `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution (increments `disputes_opened`) |
-| `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold) |
+| `resolve_dispute(caller, id, freelancer_bps)` | admin or Resolver | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold); the resolver cannot be the escrow's client or freelancer |
 | `set_panel(members, threshold)` | admin | Replace the arbiter panel (1 <= threshold <= len <= 7, unique members, else `InvalidPanel` (`31`)); emits `("panel",) -> (len, threshold)` |
 | `vote_resolution(member, id, freelancer_bps)` | panel member | Vote a split on a disputed escrow; re-votes replace earlier ones, parties cannot vote, only current members are tallied. When `threshold` members agree the escrow settles like `resolve_dispute` and one `("vote", id) -> (member, bps)` event per counted vote is emitted |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
@@ -46,7 +46,9 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `sweep_surplus(token, to) -> i128` | admin | Sweep untracked token surplus above aggregate escrow liabilities (`NoSurplus` (`21`) if none) |
 | `freeze_escrow(id, reason)` / `unfreeze_escrow(id)` / `is_frozen(id)` | admin / admin / - | Freeze a single escrow: party mutations return `EscrowFrozen` (`22`); `resolve_dispute` still works |
 | `compact_escrow(id)` | anyone | Replace a terminal escrow with a compact `EscrowReceipt` (emits `("compact", id)`). `Cancelled` any time; `Completed`/`Resolved` only after the rating or `THIRTY_DAYS_IN_LEDGERS` after closing, otherwise `NotCompactable` (`25`) |
-| `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
+| `set_paused(caller, paused)` / `is_paused()` | admin or Pauser / - | Circuit breaker for all mutations |
+| `grant_role(role, account)` / `revoke_role(role, account)` | admin | Grant or revoke a `Pauser` or `Resolver` role (`RoleUnchanged` (`33`) if no change); emits `("role_set", role) -> (account, true\|false)` |
+| `has_role(role, account)` | - | Role membership; the admin implicitly holds every role |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
 | `next_releasable(id) -> Option<u32>` | - | Lowest unreleased milestone index (`None` when all released) |
@@ -128,6 +130,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 30 | `BelowReputationThreshold` | `issue_reputation` when `released_amount < MIN_REPUTATION_VALUE` |
 | 31 | `InvalidPanel` | `set_panel` — bad threshold/size or duplicate members |
 | 32 | `PanelRequired` | `resolve_dispute` on an escrow with `total_amount >= PANEL_THRESHOLD_AMOUNT` (10^12) — settle via `vote_resolution` |
+| 33 | `RoleUnchanged` | `grant_role` on an existing member / `revoke_role` on a non-member |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
