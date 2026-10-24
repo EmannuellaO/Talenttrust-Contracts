@@ -25,6 +25,11 @@ pub const BPS_DENOMINATOR: i128 = 10_000;
 pub const MIN_MILESTONE_AMOUNT: i128 = 1_000_000;
 /// Maximum total escrow value: 10^18 stroops.
 pub const MAX_ESCROW_TOTAL: i128 = 1_000_000_000_000_000_000; // 10^18
+/// Minimum value actually released to the freelancer for a rating to count:
+/// 1 token unit at 7 decimals (10x `MIN_MILESTONE_AMOUNT`). Sybil resistance
+/// comes from this value threshold (farming reputation costs real value), not
+/// from counterparty graph analysis.
+pub const MIN_REPUTATION_VALUE: i128 = 10_000_000;
 /// Threshold for dispute outcome accounting (5,000 basis points, or 50%).
 /// In dispute resolution, if freelancer_bps >= DISPUTE_WIN_THRESHOLD_BPS,
 /// the outcome is counted as a win for the freelancer and a loss for the client; otherwise, the reverse.
@@ -68,6 +73,7 @@ pub enum EscrowError {
     InvalidSplitConfig = 27,
     OutOfOrder = 28,
     DuplicateIndex = 29,
+    BelowReputationThreshold = 30,
 }
 
 #[contracttype]
@@ -146,6 +152,15 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// Value-weighted reputation: each rating is weighted by the escrow's released amount.
+#[contracttype]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WeightedReputation {
+    pub weighted_rating_sum: i128,
+    pub weight_total: i128,
+    pub rated_contracts: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Outcomes {
@@ -185,6 +200,8 @@ enum DataKey {
     ClientReputation(Address),
     ClientRated(u64),
     Sequential(u64),
+    WeightedRep(Address),
+    RatingWeight(u64),
 }
 
 #[contract]
@@ -487,6 +504,31 @@ fn first_unreleased(c: &EscrowContract) -> Option<u32> {
         .iter()
         .position(|m| !m.released)
         .map(|i| i as u32)
+}
+
+/// Overflow-safe `round(sum * 100 / total)`; `None` when `total <= 0`.
+pub fn reputation_score(sum: i128, total: i128) -> Option<u32> {
+    if total <= 0 || sum < 0 {
+        return None;
+    }
+    let whole = sum / total;
+    let rem = sum % total;
+    // rem < total, so rem * 100 only overflows for totals near i128::MAX / 100.
+    let frac = match rem.checked_mul(100) {
+        Some(scaled) => {
+            let q = scaled / total;
+            let r = scaled % total;
+            // round half up without computing total / 2 + r overflow
+            if r >= total - r {
+                q + 1
+            } else {
+                q
+            }
+        }
+        None => rem / (total / 100),
+    };
+    let score = whole.checked_mul(100)?.checked_add(frac)?;
+    u32::try_from(score).ok()
 }
 
 pub fn transition(c: &mut EscrowContract, to: ContractStatus) -> Result<(), EscrowError> {
@@ -1204,6 +1246,10 @@ impl Escrow {
         if !(1..=5).contains(&rating) {
             return Err(EscrowError::InvalidRating);
         }
+        let weight = c.released_amount;
+        if weight < MIN_REPUTATION_VALUE {
+            return Err(EscrowError::BelowReputationThreshold);
+        }
         let key = DataKey::Reputation(c.freelancer.clone());
         let mut rep: Reputation = env.storage().persistent().get(&key).unwrap_or_default();
         rep.completed_contracts += 1;
@@ -1212,6 +1258,31 @@ impl Escrow {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+
+        let wkey = DataKey::WeightedRep(c.freelancer.clone());
+        let mut wrep: WeightedReputation =
+            env.storage().persistent().get(&wkey).unwrap_or_default();
+        wrep.weighted_rating_sum = weight
+            .checked_mul(rating as i128)
+            .and_then(|w| wrep.weighted_rating_sum.checked_add(w))
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        wrep.weight_total = wrep
+            .weight_total
+            .checked_add(weight)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        wrep.rated_contracts = wrep
+            .rated_contracts
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&wkey, &wrep);
+        env.storage()
+            .persistent()
+            .extend_ttl(&wkey, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        let weight_key = DataKey::RatingWeight(id);
+        env.storage().persistent().set(&weight_key, &weight);
+        env.storage()
+            .persistent()
+            .extend_ttl(&weight_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
 
         let issued_at = env.ledger().timestamp();
         let rating_record = RatingRecord {
@@ -1229,7 +1300,7 @@ impl Escrow {
         c.reputation_issued = true;
         save(&env, &c);
         env.events()
-            .publish((symbol_short!("rep"), id), (c.freelancer, rating));
+            .publish((symbol_short!("rep"), id), (c.freelancer, rating, weight));
         Ok(())
     }
 
@@ -1301,6 +1372,26 @@ impl Escrow {
         env.storage()
             .persistent()
             .extend_ttl(&rep_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+
+        // Reverse the value-weighted contribution as well (ratings issued before
+        // weighting existed have no stored weight and nothing to reverse).
+        if let Some(weight) = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::RatingWeight(id))
+        {
+            let wkey = DataKey::WeightedRep(record.freelancer.clone());
+            let mut wrep: WeightedReputation =
+                env.storage().persistent().get(&wkey).unwrap_or_default();
+            let contribution = weight.saturating_mul(record.rating as i128);
+            wrep.weighted_rating_sum = wrep.weighted_rating_sum.saturating_sub(contribution).max(0);
+            wrep.weight_total = wrep.weight_total.saturating_sub(weight).max(0);
+            wrep.rated_contracts = wrep.rated_contracts.saturating_sub(1);
+            env.storage().persistent().set(&wkey, &wrep);
+            env.storage()
+                .persistent()
+                .extend_ttl(&wkey, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        }
 
         record.voided = true;
         env.storage().persistent().set(&rating_key, &record);
@@ -1429,6 +1520,23 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Reputation(freelancer))
             .unwrap_or_default()
+    }
+
+    pub fn get_weighted_reputation(env: Env, freelancer: Address) -> WeightedReputation {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WeightedRep(freelancer))
+            .unwrap_or_default()
+    }
+
+    /// Value-weighted average rating scaled by 100 (e.g. `437` = 4.37), rounded
+    /// half up; `None` when the freelancer has no eligible ratings.
+    pub fn get_reputation_score(env: Env, freelancer: Address) -> Option<u32> {
+        let w: WeightedReputation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WeightedRep(freelancer))?;
+        reputation_score(w.weighted_rating_sum, w.weight_total)
     }
 
     pub fn get_client_reputation(env: Env, client: Address) -> Reputation {

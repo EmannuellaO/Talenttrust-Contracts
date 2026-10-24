@@ -52,6 +52,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_escrow_summary(id)` | - | Status and derived balances (`held`, `remaining_to_fund`, milestone counts, next unreleased index, whether the held balance covers it) |
 | `get_escrow_summaries(ids)` | - | Up to 25 summaries; unknown ids skipped, larger batches return `InvalidAmount` |
 | `get_team_split(id)` | - | Configured team split (empty if unset) |
+| `get_reputation_score(addr) -> Option<u32>` | - | Value-weighted average rating ×100 (e.g. `437` = 4.37), rounded half up; `None` without eligible ratings |
+| `get_weighted_reputation(addr)` | - | `WeightedReputation { weighted_rating_sum, weight_total, rated_contracts }` (weight = released amount) |
 | `get_client_reputation(addr)` | - | Client reputation accumulated from freelancer ratings |
 | `get_receipt(id) -> Option<EscrowReceipt>` | - | Receipt of a compacted escrow; `get_contract` on a compacted id returns `EscrowCompacted` (`26`) |
 | `get_payout_address(id)` | - | Payout address for an escrow (falls back to the freelancer) |
@@ -120,8 +122,9 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 27 | `InvalidSplitConfig` | `set_team_split` — bad length, zero/duplicate share, client/contract payee, or sum != 10 000 |
 | 28 | `OutOfOrder` | `release_milestone` / `release_milestones` on a sequential escrow before all earlier milestones are released |
 | 29 | `DuplicateIndex` | `release_milestones` with a repeated index |
+| 30 | `BelowReputationThreshold` | `issue_reputation` when `released_amount < MIN_REPUTATION_VALUE` |
 
-Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
+Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
 Error codes are **append-only** and never renumbered — the frontend and backend map directly on them.
 

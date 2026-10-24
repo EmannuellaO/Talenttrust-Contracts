@@ -2855,3 +2855,129 @@ fn release_milestones_non_sequential_any_order() {
         .release_milestones(&id, &vec![&s.env, 2u32, 0u32, 1u32]);
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
 }
+
+// ---------------------------------------------------------------------------
+// Value-weighted reputation
+// ---------------------------------------------------------------------------
+
+fn completed_escrow(s: &Setup, amount: i128) -> u64 {
+    StellarAssetClient::new(&s.env, &s.token.address).mint(&s.client, &amount);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, amount],
+    );
+    s.escrow.deposit_funds(&id, &amount);
+    s.escrow.release_milestone(&id, &0);
+    id
+}
+
+#[test]
+fn dust_release_rating_returns_below_threshold() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.open_dispute(&id, &s.client);
+    // 1 bps of the held balance reaches the freelancer: far below the threshold
+    s.escrow.resolve_dispute(&id, &1);
+    assert!(s.escrow.get_contract(&id).released_amount < MIN_REPUTATION_VALUE);
+    assert_eq!(
+        s.escrow.try_issue_reputation(&id, &5),
+        Err(Ok(EscrowError::BelowReputationThreshold))
+    );
+    assert_eq!(s.escrow.get_reputation(&s.freelancer), Reputation::default());
+    assert_eq!(s.escrow.get_reputation_score(&s.freelancer), None);
+}
+
+#[test]
+fn weighted_score_large_and_small_job() {
+    let s = setup();
+    // 1 token unit = 10 * U; a 5-star 1,000-unit job and a 1-star 10-unit job.
+    let unit = MIN_REPUTATION_VALUE;
+    let big = completed_escrow(&s, 1_000 * unit);
+    let small = completed_escrow(&s, 10 * unit);
+    s.escrow.issue_reputation(&big, &5);
+    s.escrow.issue_reputation(&small, &1);
+    // (5 * 1000 + 1 * 10) / 1010 = 4.9603 -> 496
+    assert_eq!(s.escrow.get_reputation_score(&s.freelancer), Some(496));
+    let w = s.escrow.get_weighted_reputation(&s.freelancer);
+    assert_eq!(w.rated_contracts, 2);
+    assert_eq!(w.weight_total, 1_010 * unit);
+    assert_eq!(w.weighted_rating_sum, 5_010 * unit);
+    // Legacy reputation keeps incrementing as before
+    let rep = s.escrow.get_reputation(&s.freelancer);
+    assert_eq!(rep.completed_contracts, 2);
+    assert_eq!(rep.total_rating, 6);
+}
+
+#[test]
+fn weighted_score_rounds_half_up() {
+    let s = setup();
+    let unit = MIN_REPUTATION_VALUE;
+    let a = completed_escrow(&s, 2 * unit);
+    let b = completed_escrow(&s, unit);
+    s.escrow.issue_reputation(&a, &5);
+    s.escrow.issue_reputation(&b, &4);
+    // (5 * 2 + 4 * 1) / 3 = 4.6667 -> 467 (truncation would give 466)
+    assert_eq!(s.escrow.get_reputation_score(&s.freelancer), Some(467));
+}
+
+#[test]
+fn reputation_score_is_overflow_safe() {
+    assert_eq!(reputation_score(i128::MAX, i128::MAX), Some(100));
+    assert_eq!(reputation_score(5 * (i128::MAX / 5), i128::MAX / 5), Some(500));
+    let near = reputation_score(i128::MAX, i128::MAX / 2 + 1).unwrap();
+    assert!((199..=200).contains(&near));
+    assert_eq!(reputation_score(0, 0), None);
+    // A rating at the maximum escrow value does not overflow the contract path
+    let s = setup();
+    StellarAssetClient::new(&s.env, &s.token.address).mint(&s.client, &MAX_ESCROW_TOTAL);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, MAX_ESCROW_TOTAL],
+    );
+    s.escrow.deposit_funds(&id, &MAX_ESCROW_TOTAL);
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.issue_reputation(&id, &5);
+    assert_eq!(s.escrow.get_reputation_score(&s.freelancer), Some(500));
+}
+
+#[test]
+fn voiding_rating_reverses_weighted_reputation() {
+    let s = setup();
+    let unit = MIN_REPUTATION_VALUE;
+    let a = completed_escrow(&s, 1_000 * unit);
+    let b = completed_escrow(&s, 10 * unit);
+    s.escrow.issue_reputation(&a, &5);
+    s.escrow.issue_reputation(&b, &1);
+    s.escrow.void_rating(&a, &symbol_short!("fraud"));
+    assert_eq!(s.escrow.get_reputation_score(&s.freelancer), Some(100));
+    let w = s.escrow.get_weighted_reputation(&s.freelancer);
+    assert_eq!(w.rated_contracts, 1);
+    assert_eq!(w.weight_total, 10 * unit);
+}
+
+#[test]
+fn rep_event_includes_weight() {
+    let s = setup();
+    let id = completed_escrow(&s, 20 * U);
+    s.escrow.issue_reputation(&id, &4);
+    let events = s.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap(),
+        symbol_short!("rep")
+    );
+    let (who, rating, weight) = <(Address, u32, i128)>::try_from_val(&s.env, &last.2).unwrap();
+    assert_eq!(who, s.freelancer);
+    assert_eq!(rating, 4);
+    assert_eq!(weight, 20 * U);
+}
