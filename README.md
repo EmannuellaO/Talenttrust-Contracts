@@ -37,6 +37,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution (increments `disputes_opened`) |
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold) |
+| `set_panel(members, threshold)` | admin | Replace the arbiter panel (1 <= threshold <= len <= 7, unique members, else `InvalidPanel` (`31`)); emits `("panel",) -> (len, threshold)` |
+| `vote_resolution(member, id, freelancer_bps)` | panel member | Vote a split on a disputed escrow; re-votes replace earlier ones, parties cannot vote, only current members are tallied. When `threshold` members agree the escrow settles like `resolve_dispute` and one `("vote", id) -> (member, bps)` event per counted vote is emitted |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
 | `rate_client(id, rating)` | freelancer | Rate the client of a completed or resolved job (1-5), once; emits `("rep_cli", id) -> (client, rating)` |
@@ -55,6 +57,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_reputation_score(addr) -> Option<u32>` | - | Value-weighted average rating ×100 (e.g. `437` = 4.37), rounded half up; `None` without eligible ratings |
 | `get_weighted_reputation(addr)` | - | `WeightedReputation { weighted_rating_sum, weight_total, rated_contracts }` (weight = released amount) |
 | `get_client_reputation(addr)` | - | Client reputation accumulated from freelancer ratings |
+| `get_panel()`, `get_votes(id)` | - | Current arbiter panel and the votes on a disputed escrow (cleared after settlement) |
 | `get_receipt(id) -> Option<EscrowReceipt>` | - | Receipt of a compacted escrow; `get_contract` on a compacted id returns `EscrowCompacted` (`26`) |
 | `get_payout_address(id)` | - | Payout address for an escrow (falls back to the freelancer) |
 | `get_liability(token)` | - | Aggregate amount held for live escrows in `token` |
@@ -123,6 +126,8 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 28 | `OutOfOrder` | `release_milestone` / `release_milestones` on a sequential escrow before all earlier milestones are released |
 | 29 | `DuplicateIndex` | `release_milestones` with a repeated index |
 | 30 | `BelowReputationThreshold` | `issue_reputation` when `released_amount < MIN_REPUTATION_VALUE` |
+| 31 | `InvalidPanel` | `set_panel` — bad threshold/size or duplicate members |
+| 32 | `PanelRequired` | `resolve_dispute` on an escrow with `total_amount >= PANEL_THRESHOLD_AMOUNT` (10^12) — settle via `vote_resolution` |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
