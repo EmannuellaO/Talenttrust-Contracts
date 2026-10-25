@@ -40,6 +40,9 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `resolve_dispute(caller, id, freelancer_bps)` | admin or Resolver | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold); the resolver cannot be the escrow's client or freelancer |
 | `set_panel(members, threshold)` | admin | Replace the arbiter panel (1 <= threshold <= len <= 7, unique members, else `InvalidPanel` (`31`)); emits `("panel",) -> (len, threshold)` |
 | `vote_resolution(member, id, freelancer_bps)` | panel member | Vote a split on a disputed escrow; re-votes replace earlier ones, parties cannot vote, only current members are tallied. When `threshold` members agree the escrow settles like `resolve_dispute` and one `("vote", id) -> (member, bps)` event per counted vote is emitted |
+| `propose_change_order(id, amounts)` | client | Propose extra milestones for a `Created`/`Funded`/`Completed` escrow (`existing + new <= 20`, else `InvalidMilestones`) |
+| `accept_change_order(id) -> (u32, i128)` | freelancer | Append the proposed milestones, grow `total_amount` and reopen the escrow as `Created` (needs funding; a fresh funding window starts); emits `("chg_ord", id) -> (added_count, added_total)`. A rating already issued stays issued, so `issue_reputation` remains blocked for that escrow |
+| `reject_change_order(id)` / `get_change_order(id)` | freelancer / - | Drop / read the pending proposal (`ChangeOrderNotFound` (`37`) if none) |
 | `expire_unfunded(id)` | anyone | After the 14-day funding window (`FUNDING_WINDOW_SECS`), cancel an escrow still `Created` with nothing released and refund any partial deposit to its funders; emits `("expired", id) -> refund`. `NotExpired` (`36`) before the deadline |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
@@ -77,6 +80,7 @@ Status transitions are centrally validated by a guarded state machine:
 - `Created | Funded -> Disputed`
 - `Disputed -> Resolved`
 - `Created | Funded -> Cancelled`
+- `Funded | Completed -> Created` only through `accept_change_order` (a dedicated, separately guarded reopen)
 
 Any other status transition returns `EscrowError::InvalidTransition` (`20`). Attempting to `deposit_funds` on an already `Funded` contract returns `EscrowError::InvalidStatus` (`1`) up front.
 
@@ -138,6 +142,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 34 | `TooManyFunders` | `deposit_funds` / `deposit_from` by an 11th distinct funder |
 | 35 | `FundingExpired` | deposit into a `Created` escrow after its funding deadline |
 | 36 | `NotExpired` | `expire_unfunded` at or before the funding deadline |
+| 37 | `ChangeOrderNotFound` | `accept_change_order` / `reject_change_order` without a pending proposal |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

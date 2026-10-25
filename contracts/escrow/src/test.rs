@@ -4022,3 +4022,200 @@ fn expire_unfunded_refunds_sponsors_pro_rata_and_clears_liability() {
     check_invariants(&c);
     assert_eq!(c.refunded_amount, 50 * U);
 }
+
+// ---------------------------------------------------------------------------
+// Change orders
+// ---------------------------------------------------------------------------
+
+#[test]
+fn change_order_on_funded_requires_top_up() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+
+    s.escrow.propose_change_order(&id, &vec![&s.env, 50 * U]);
+    let (count, total) = s.escrow.accept_change_order(&id);
+    assert_eq!(count, 1);
+    assert_eq!(total, 50 * U);
+
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Created);
+    assert_eq!(c.total_amount, 350 * U);
+    assert_eq!(c.funded_amount, 300 * U);
+    assert_eq!(c.milestones.len(), 3);
+
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(s.token.balance(&s.freelancer), 300 * U);
+
+    // The new milestone is unfunded: existing balance is exhausted.
+    assert!(s.escrow.try_release_milestone(&id, &2).is_err());
+
+    // Client tops up the added amount.
+    s.escrow.deposit_funds(&id, &(50 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    s.escrow.release_milestone(&id, &2);
+    assert_eq!(s.token.balance(&s.freelancer), 350 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn change_order_on_completed_reopens_and_completes_again() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+
+    s.escrow.propose_change_order(&id, &vec![&s.env, 40 * U]);
+    let (count, total) = s.escrow.accept_change_order(&id);
+    assert_eq!(count, 1);
+    assert_eq!(total, 40 * U);
+
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Created);
+    assert_eq!(c.total_amount, 140 * U);
+    assert_eq!(c.funded_amount, 100 * U);
+
+    s.escrow.deposit_funds(&id, &(40 * U));
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.token.balance(&s.freelancer), 140 * U);
+}
+
+#[test]
+fn change_order_exceeding_max_milestones_rejected() {
+    let s = setup();
+    let mut amounts = Vec::new(&s.env);
+    for _ in 0..MAX_MILESTONES {
+        amounts.push_back(U);
+    }
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &amounts);
+    s.escrow.deposit_funds(&id, &(20 * U));
+
+    let mut extra = Vec::new(&s.env);
+    extra.push_back(U);
+    assert_eq!(
+        s.escrow.try_propose_change_order(&id, &extra),
+        Err(Ok(EscrowError::InvalidMilestones))
+    );
+}
+
+#[test]
+fn freelancer_can_reject_change_order() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+
+    s.escrow.propose_change_order(&id, &vec![&s.env, 50 * U]);
+    s.escrow.reject_change_order(&id);
+
+    assert_eq!(
+        s.escrow.try_accept_change_order(&id),
+        Err(Ok(EscrowError::ChangeOrderNotFound))
+    );
+
+    s.escrow.propose_change_order(&id, &vec![&s.env, 25 * U]);
+    let (count, total) = s.escrow.accept_change_order(&id);
+    assert_eq!(count, 1);
+    assert_eq!(total, 25 * U);
+}
+
+#[test]
+fn client_cannot_accept_own_change_order() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.propose_change_order(&id, &vec![&s.env, 50 * U]);
+
+    // Switch from mocked auth to real auth: no address is authorized now.
+    s.env.set_auths(&[]);
+
+    // The client cannot accept their own change order (only the freelancer can).
+    assert!(s.escrow.try_accept_change_order(&id).is_err());
+
+    // With mocking back on, the freelancer accepts normally.
+    s.env.mock_all_auths();
+    let (count, total) = s.escrow.accept_change_order(&id);
+    assert_eq!((count, total), (1, 50 * U));
+}
+
+
+#[test]
+fn change_order_resets_funding_deadline_and_keeps_rating_blocked() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.issue_reputation(&id, &5);
+
+    // Long after the original funding window, a change order reopens the escrow
+    let later = s.escrow.get_fund_by(&id) + 30 * 86_400;
+    s.env.ledger().with_mut(|li| li.timestamp = later);
+    s.escrow.propose_change_order(&id, &vec![&s.env, 40 * U]);
+    s.escrow.accept_change_order(&id);
+    assert_eq!(s.escrow.get_fund_by(&id), later + FUNDING_WINDOW_SECS);
+    check_invariants(&s.escrow.get_contract(&id));
+
+    s.escrow.deposit_funds(&id, &(40 * U));
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    // Reputation was already issued for this escrow and stays blocked
+    assert_eq!(
+        s.escrow.try_issue_reputation(&id, &5),
+        Err(Ok(EscrowError::ReputationAlreadyIssued))
+    );
+}
+
+#[test]
+fn change_order_rejected_while_disputed_or_too_small() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    assert_eq!(
+        s.escrow.try_propose_change_order(&id, &vec![&s.env, 1i128]),
+        Err(Ok(EscrowError::MilestoneTooSmall))
+    );
+    assert_eq!(
+        s.escrow.try_propose_change_order(&id, &Vec::new(&s.env)),
+        Err(Ok(EscrowError::InvalidMilestones))
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.open_dispute(&id, &s.client);
+    assert_eq!(
+        s.escrow.try_propose_change_order(&id, &vec![&s.env, 10 * U]),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}

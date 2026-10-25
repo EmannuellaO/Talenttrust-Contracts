@@ -93,6 +93,7 @@ pub enum EscrowError {
     TooManyFunders = 34,
     FundingExpired = 35,
     NotExpired = 36,
+    ChangeOrderNotFound = 37,
 }
 
 #[contracttype]
@@ -242,6 +243,7 @@ enum DataKey {
     RoleMember(Role, Address),
     Funders(u64),
     FundBy(u64),
+    ChangeOrder(u64),
 }
 
 #[contract]
@@ -524,23 +526,16 @@ fn build_escrow(
     }
 
     // ---- Amounts ----
+    let total = checked_milestone_total(&milestone_amounts)?;
+    if total > MAX_ESCROW_TOTAL {
+        return Err(EscrowError::InvalidAmount);
+    }
     let mut milestones = Vec::new(&env);
-    let mut total: i128 = 0;
     for amount in milestone_amounts.iter() {
-        if amount <= 0 {
-            return Err(EscrowError::InvalidAmount);
-        }
-        if amount < MIN_MILESTONE_AMOUNT {
-            return Err(EscrowError::MilestoneTooSmall);
-        }
-        total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
         milestones.push_back(Milestone {
             amount,
             released: false,
         });
-    }
-    if total > MAX_ESCROW_TOTAL {
-        return Err(EscrowError::InvalidAmount);
     }
     let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
     env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -572,6 +567,22 @@ fn build_escrow(
     env.events()
         .publish((symbol_short!("created"), id), (client, freelancer, total));
     Ok(id)
+}
+
+/// Validates milestone amounts (each positive and >= `MIN_MILESTONE_AMOUNT`)
+/// and returns their checked sum. Shared by creation and change orders.
+fn checked_milestone_total(amounts: &Vec<i128>) -> Result<i128, EscrowError> {
+    let mut total: i128 = 0;
+    for amount in amounts.iter() {
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if amount < MIN_MILESTONE_AMOUNT {
+            return Err(EscrowError::MilestoneTooSmall);
+        }
+        total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
+    }
+    Ok(total)
 }
 
 fn is_sequential(env: &Env, id: u64) -> bool {
@@ -1483,6 +1494,125 @@ impl Escrow {
             }
         }
         Ok(())
+    }
+
+    /// Client proposes extra milestones for an active (`Created` / `Funded`) or
+    /// `Completed` escrow. `existing + new <= MAX_MILESTONES`, each amount
+    /// >= `MIN_MILESTONE_AMOUNT`. Replaces any pending proposal.
+    pub fn propose_change_order(env: Env, id: u64, amounts: Vec<i128>) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.client.require_auth();
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Completed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let added = amounts.len();
+        if added == 0 || c.milestones.len() + added > MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        let added_total = checked_milestone_total(&amounts)?;
+        let new_total = c
+            .total_amount
+            .checked_add(added_total)
+            .ok_or(EscrowError::InvalidAmount)?;
+        if new_total > MAX_ESCROW_TOTAL {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let key = DataKey::ChangeOrder(id);
+        env.storage().persistent().set(&key, &amounts);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("chg_prop"), id), (added, added_total));
+        Ok(())
+    }
+
+    /// Freelancer accepts the pending change order: the milestones are appended
+    /// (existing ones are untouched), `total_amount` grows and the escrow is
+    /// reopened as `Created` so the added amount must be funded, even if it was
+    /// `Completed`. A reputation already issued for the escrow stays issued, so
+    /// `issue_reputation` remains blocked for it. Returns `(added_count, added_total)`.
+    pub fn accept_change_order(env: Env, id: u64) -> Result<(u32, i128), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        let key = DataKey::ChangeOrder(id);
+        let amounts: Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::ChangeOrderNotFound)?;
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Completed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let added = amounts.len();
+        if c.milestones.len() + added > MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestones);
+        }
+        let added_total = checked_milestone_total(&amounts)?;
+        let new_total = c
+            .total_amount
+            .checked_add(added_total)
+            .ok_or(EscrowError::InvalidAmount)?;
+        if new_total > MAX_ESCROW_TOTAL {
+            return Err(EscrowError::InvalidAmount);
+        }
+        for amount in amounts.iter() {
+            c.milestones.push_back(Milestone {
+                amount,
+                released: false,
+            });
+        }
+        c.total_amount = new_total;
+        // Dedicated, guarded reopen (not part of the normal lifecycle machine):
+        // only Created / Funded / Completed may return to Created.
+        c.status = ContractStatus::Created;
+        env.storage().persistent().remove(&key);
+        // No longer terminal: drop the close timestamp and open a fresh funding window.
+        env.storage().persistent().remove(&DataKey::ClosedAt(id));
+        let fund_by = env
+            .ledger()
+            .timestamp()
+            .checked_add(FUNDING_WINDOW_SECS)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        let fund_key = DataKey::FundBy(id);
+        env.storage().persistent().set(&fund_key, &fund_by);
+        env.storage()
+            .persistent()
+            .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        #[cfg(any(test, debug_assertions))]
+        check_invariants(&c);
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("chg_ord"), id), (added, added_total));
+        Ok((added, added_total))
+    }
+
+    /// Freelancer rejects (removes) the pending change order.
+    pub fn reject_change_order(env: Env, id: u64) -> Result<(), EscrowError> {
+        let c = load(&env, id)?;
+        c.freelancer.require_auth();
+        let key = DataKey::ChangeOrder(id);
+        if !env.storage().persistent().has(&key) {
+            return Err(EscrowError::ChangeOrderNotFound);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish((symbol_short!("chg_rej"), id), ());
+        Ok(())
+    }
+
+    /// Pending change order amounts for an escrow, if any.
+    pub fn get_change_order(env: Env, id: u64) -> Option<Vec<i128>> {
+        env.storage().persistent().get(&DataKey::ChangeOrder(id))
     }
 
     /// Anyone may expire an escrow that is still `Created` (not fully funded,
