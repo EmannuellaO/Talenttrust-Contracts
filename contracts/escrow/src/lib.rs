@@ -10,6 +10,8 @@
 //! 7. After completion the client may `issue_reputation` for the freelancer.
 //! 8. The client may `pay_bonus` directly to the freelancer (tip/bonus).
 //! 9. After completion or resolution the freelancer may `rate_client` to rate the client.
+//! 10. Anyone may `expire_unfunded` an escrow still unfunded past its funding deadline,
+//!     refunding any partial deposit to its funders.
 #![no_std]
 
 use soroban_sdk::{
@@ -21,6 +23,9 @@ pub const MAX_MILESTONES: u32 = 20;
 /// Maximum number of ids accepted by `get_escrow_summaries`.
 pub const MAX_SUMMARY_BATCH: u32 = 25;
 pub const BPS_DENOMINATOR: i128 = 10_000;
+/// Funding window after creation (14 days); afterwards an escrow still in
+/// `Created` can no longer be funded and may be expired by anyone.
+pub const FUNDING_WINDOW_SECS: u64 = 14 * 86_400;
 /// Minimum amount for a single milestone: 0.1 token unit at 7 decimal places.
 pub const MIN_MILESTONE_AMOUNT: i128 = 1_000_000;
 /// Maximum total escrow value: 10^18 stroops.
@@ -86,6 +91,8 @@ pub enum EscrowError {
     PanelRequired = 32,
     RoleUnchanged = 33,
     TooManyFunders = 34,
+    FundingExpired = 35,
+    NotExpired = 36,
 }
 
 #[contracttype]
@@ -234,6 +241,7 @@ enum DataKey {
     Votes(u64),
     RoleMember(Role, Address),
     Funders(u64),
+    FundBy(u64),
 }
 
 #[contract]
@@ -537,6 +545,16 @@ fn build_escrow(
     let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
     env.storage().instance().set(&DataKey::NextId, &(id + 1));
     bump_instance(&env);
+    let fund_by = env
+        .ledger()
+        .timestamp()
+        .checked_add(FUNDING_WINDOW_SECS)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
+    let fund_key = DataKey::FundBy(id);
+    env.storage().persistent().set(&fund_key, &fund_by);
+    env.storage()
+        .persistent()
+        .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
     let c = EscrowContract {
         id,
         client: client.clone(),
@@ -684,6 +702,16 @@ fn apply_deposit(
     funder.require_auth();
     if c.status != ContractStatus::Created {
         return Err(EscrowError::InvalidStatus);
+    }
+    // Escrows created before funding deadlines existed have no `FundBy` entry.
+    if let Some(fund_by) = env
+        .storage()
+        .persistent()
+        .get::<_, u64>(&DataKey::FundBy(c.id))
+    {
+        if env.ledger().timestamp() > fund_by {
+            return Err(EscrowError::FundingExpired);
+        }
     }
     if amount <= 0 {
         return Err(EscrowError::InvalidAmount);
@@ -1455,6 +1483,47 @@ impl Escrow {
             }
         }
         Ok(())
+    }
+
+    /// Anyone may expire an escrow that is still `Created` (not fully funded,
+    /// nothing released) after its funding deadline. Any partial deposit is
+    /// refunded to its funders (the client unless sponsors contributed) and the
+    /// escrow is `Cancelled`. Emits `("expired", id) -> refund`.
+    pub fn expire_unfunded(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        if c.status != ContractStatus::Created || c.released_amount != 0 {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let fund_by: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundBy(id))
+            .ok_or(EscrowError::NotExpired)?;
+        if env.ledger().timestamp() <= fund_by {
+            return Err(EscrowError::NotExpired);
+        }
+        let refund = c.funded_amount;
+        refund_funders(&env, &c, refund)?;
+        c.refunded_amount = refund;
+        c.funded_amount = 0;
+        transition(&mut c, ContractStatus::Cancelled)?;
+        record_closed_at(&env, id);
+        sub_liability(&env, &c.token, refund)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        env.events().publish((symbol_short!("expired"), id), refund);
+        Ok(())
+    }
+
+    /// Funding deadline (ledger timestamp) of an escrow; `0` if none is recorded.
+    pub fn get_fund_by(env: Env, id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FundBy(id))
+            .unwrap_or(0)
     }
 
     /// Client cancels the agreement and recovers any unreleased funds.

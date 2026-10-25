@@ -3662,3 +3662,363 @@ fn deposit_from_respects_freeze_and_status() {
     );
     assert_eq!(s.escrow.get_liability(&s.token.address), 50 * U);
 }
+
+// ---------------------------------------------------------------------------
+// Funding deadline and expiry
+// ---------------------------------------------------------------------------
+
+fn set_now(env: &Env, secs: u64) {
+    env.ledger().with_mut(|li| {
+        li.timestamp = secs;
+    });
+}
+
+#[test]
+fn test_funding_deadline_boundaries_deposit() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let fund_by = s.escrow.get_fund_by(&id);
+    assert_eq!(fund_by, 1_000_000 + FUNDING_WINDOW_SECS);
+
+    // At now == fund_by, deposit must not be rejected because of funding deadline
+    set_now(&s.env, fund_by);
+    s.escrow.deposit_funds(&id, &(50 * U));
+    assert_eq!(s.token.balance(&s.client), 950 * U);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Created);
+    assert_eq!(c.funded_amount, 50 * U);
+
+    // At now == fund_by + 1, deposit must be rejected with FundingExpired
+    set_now(&s.env, fund_by + 1);
+    assert_eq!(
+        s.escrow.try_deposit_funds(&id, &(50 * U)),
+        Err(Ok(EscrowError::FundingExpired))
+    );
+    // Escrow state remains unchanged
+    let c_after = s.escrow.get_contract(&id);
+    assert_eq!(c_after.status, ContractStatus::Created);
+    assert_eq!(c_after.funded_amount, 50 * U);
+    assert_eq!(s.token.balance(&s.client), 950 * U);
+}
+
+#[test]
+fn test_funding_deadline_boundaries_expire() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let fund_by = s.escrow.get_fund_by(&id);
+
+    // At now == fund_by, expire_unfunded must fail with NotExpired
+    set_now(&s.env, fund_by);
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id),
+        Err(Ok(EscrowError::NotExpired))
+    );
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Created);
+
+    // At now == fund_by + 1, expire_unfunded must succeed
+    set_now(&s.env, fund_by + 1);
+    assert_eq!(s.escrow.try_expire_unfunded(&id), Ok(Ok(())));
+    assert_eq!(
+        s.escrow.get_contract(&id).status,
+        ContractStatus::Cancelled
+    );
+}
+
+#[test]
+fn test_partial_deposit_refund_third_party() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    // Client starts with 1,000 tokens
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+
+    // Create escrow with total 100 and partial deposit of 40
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 60 * U, 40 * U],
+    );
+    s.escrow.deposit_funds(&id, &(40 * U));
+    assert_eq!(s.token.balance(&s.client), 960 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Created);
+
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    // Third-party caller invoking expire_unfunded
+    let third_party = Address::generate(&s.env);
+    assert_eq!(s.token.balance(&third_party), 0);
+
+    let res = s
+        .escrow
+        .mock_auths(&[MockAuth {
+            address: &third_party,
+            invoke: &MockAuthInvoke {
+                contract: &s.escrow.address,
+                fn_name: "expire_unfunded",
+                args: (id,).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_expire_unfunded(&id);
+
+    assert_eq!(res, Ok(Ok(())));
+
+    // Client token balance increases by exactly the refunded amount (40) back to 1,000
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    // Third-party and freelancer receive no refund
+    assert_eq!(s.token.balance(&third_party), 0);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+
+    // Status is Cancelled and accounting is consistent
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Cancelled);
+    assert_eq!(c.funded_amount, 0);
+    assert_eq!(c.released_amount, 0);
+}
+
+#[test]
+fn test_fully_funded_escrow_protection() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    // Escrow in Funded state cannot be expired
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    // Verify no refund or state change occurs
+    assert_eq!(s.token.balance(&s.client), 900 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+
+    // Funded escrows reject further deposits by status, not by the funding deadline
+    assert_eq!(
+        s.escrow.try_deposit_funds(&id, &U),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn test_released_milestone_protection() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    // Create contract with 2 milestones (50, 50)
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U, 50 * U],
+    );
+    // Partial deposit 50
+    s.escrow.deposit_funds(&id, &(50 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Created);
+
+    // Release first milestone
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 50 * U);
+
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Created);
+    assert_eq!(c.released_amount, 50 * U);
+
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    // Escrow with released_amount > 0 cannot be expired
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    // Verify no unintended refund or state change occurs
+    let c_after = s.escrow.get_contract(&id);
+    assert_eq!(c_after.status, ContractStatus::Created);
+    assert_eq!(c_after.released_amount, 50 * U);
+    assert_eq!(c_after.funded_amount, 50 * U);
+    assert_eq!(s.token.balance(&s.client), 950 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 50 * U);
+}
+
+#[test]
+fn test_expire_unfunded_event_verification() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(40 * U));
+
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    s.escrow.expire_unfunded(&id);
+
+    // Assert successful expiration emits ("expired", id) with refund data (40)
+    let events = s.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, s.escrow.address);
+    assert_eq!(last.1.len(), 2);
+    let topic_sym = Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap();
+    let topic_id = u64::try_from_val(&s.env, &last.1.get(1).unwrap()).unwrap();
+    assert_eq!(topic_sym, symbol_short!("expired"));
+    assert_eq!(topic_id, id);
+
+    let refunded = i128::try_from_val(&s.env, &last.2).unwrap();
+    assert_eq!(refunded, 40 * U);
+
+    // Second escrow which is not expired
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    // Expiration fails with NotExpired
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id2),
+        Err(Ok(EscrowError::NotExpired))
+    );
+    // Verify that unsuccessful expiration does not produce an expired event for id2
+    let has_expired_event_id2 = s.env.events().all().iter().any(|e| {
+        if e.0 == s.escrow.address && e.1.len() >= 2 {
+            let sym = Symbol::try_from_val(&s.env, &e.1.get(0).unwrap());
+            let topic_id = u64::try_from_val(&s.env, &e.1.get(1).unwrap());
+            sym == Ok(symbol_short!("expired")) && topic_id == Ok(id2)
+        } else {
+            false
+        }
+    });
+    assert!(!has_expired_event_id2);
+}
+
+#[test]
+fn test_expire_unfunded_zero_deposit() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    s.escrow.expire_unfunded(&id);
+
+    let events = s.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, s.escrow.address);
+    assert_eq!(last.1.len(), 2);
+    let topic_sym = Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap();
+    let topic_id = u64::try_from_val(&s.env, &last.1.get(1).unwrap()).unwrap();
+    assert_eq!(topic_sym, symbol_short!("expired"));
+    assert_eq!(topic_id, id);
+    let refunded = i128::try_from_val(&s.env, &last.2).unwrap();
+    assert_eq!(refunded, 0i128);
+
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Cancelled);
+    assert_eq!(c.funded_amount, 0);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+}
+
+#[test]
+fn test_expire_unfunded_pause_gate_and_status_checks() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let fund_by = s.escrow.get_fund_by(&id);
+    set_now(&s.env, fund_by + 1);
+
+    // Pause blocks expire_unfunded
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id),
+        Err(Ok(EscrowError::Paused))
+    );
+
+    // Unpause allows expire_unfunded
+    s.escrow.set_paused(&s.admin, &false);
+    assert_eq!(s.escrow.try_expire_unfunded(&id), Ok(Ok(())));
+
+    // Re-expiring an already cancelled escrow fails with InvalidStatus
+    assert_eq!(
+        s.escrow.try_expire_unfunded(&id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+
+    // Depositing into cancelled escrow fails with InvalidStatus
+    assert_eq!(
+        s.escrow.try_deposit_funds(&id, &(50 * U)),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+
+    // Missing storage for get_fund_by returns 0 default
+    assert_eq!(s.escrow.get_fund_by(&999), 0);
+}
+
+
+#[test]
+fn expire_unfunded_refunds_sponsors_pro_rata_and_clears_liability() {
+    let s = setup();
+    set_now(&s.env, 1_000_000);
+    let sponsor = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &s.token.address).mint(&sponsor, &(100 * U));
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_from(&id, &sponsor, &(30 * U));
+    s.escrow.deposit_funds(&id, &(20 * U));
+    set_now(&s.env, s.escrow.get_fund_by(&id) + 1);
+    s.escrow.expire_unfunded(&id);
+    assert_eq!(s.token.balance(&sponsor), 100 * U);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    let c = s.escrow.get_contract(&id);
+    check_invariants(&c);
+    assert_eq!(c.refunded_amount, 50 * U);
+}
