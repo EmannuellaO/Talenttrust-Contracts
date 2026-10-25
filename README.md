@@ -96,9 +96,31 @@ Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not chan
 
 ### Events
 
+Core lifecycle events are versioned and structured: escrow events use topics
+`(EVENT_SCHEMA_V = 1, symbol, id)` and global events `(1, symbol)`, with one
+`#[contracttype]` payload struct per event so indexers need not call `get_contract`.
+
+| Event | Topic | Payload | Emitted when |
+| --- | --- | --- | --- |
+| init | `(1, "init")` | `admin: Address` | `initialize` |
+| paused | `(1, "paused")` | `bool` | `set_paused` |
+| created | `(1, "created", id)` | `CreatedEvent { client, freelancer, token, total, milestone_count }` | `create_contract`, `create_contract_sequential`, `create_and_fund` |
+| deposit | `(1, "deposit", id)` | `DepositEvent { from, amount, funded_amount, status }` | `deposit_funds`, `deposit_from`, `create_and_fund` |
+| release | `(1, "release", id)` | `ReleaseEvent { index, amount, to, released_amount, status }` | `release_milestone`, `release_milestones` (one per milestone) |
+| complete | `(1, "complete", id)` | `CompletedEvent { released_amount }` | exactly once, when the last milestone is released (single, batch or partial release) |
+| dispute | `(1, "dispute", id)` | `DisputeEvent { by, status }` | `open_dispute` |
+| resolved | `(1, "resolved", id)` | `ResolvedEvent { to_freelancer, to_client, status }` | `resolve_dispute`, panel settlement |
+| cancel | `(1, "cancel", id)` | `CancelEvent { refund, to, status }` (`to` is the client; refunds go pro-rata to funders) | `cancel_contract` |
+| rep | `(1, "rep", id)` | `ReputationEvent { freelancer, rating, completed_contracts, total_rating, weight }` | `issue_reputation` |
+
+Feature-specific events keep their `(symbol, id)` topics, e.g.:
+
 | Event | Topic | Data |
 | --- | --- | --- |
 | Bonus paid | `("bonus", id)` | `(amount, cumulative)` |
+| Partial release | `("rel_part", id)` | `(index, amount, remaining)` |
+| Batch release | `("rel_batch", id)` | `(count, total)` |
+| Panel vote recorded | `("voted", id)` | `(member, freelancer_bps)` |
 
 Bonus payments reuse the escrow's existing validation errors: a missing escrow `id`, an escrow in a disallowed state (`Disputed`, `Cancelled`, `Resolved`), a non-positive `amount`, an unauthorized caller (client auth required), and the pause gate all return the corresponding contract error.
 

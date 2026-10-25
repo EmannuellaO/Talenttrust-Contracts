@@ -173,6 +173,86 @@ pub struct Reputation {
     pub total_rating: u32,
 }
 
+/// Schema version carried as the first topic of every structured event.
+pub const EVENT_SCHEMA_V: u32 = 1;
+
+/// `(1, "created", id)` — a new escrow was created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedEvent {
+    pub client: Address,
+    pub freelancer: Address,
+    pub token: Address,
+    pub total: i128,
+    pub milestone_count: u32,
+}
+
+/// `(1, "deposit", id)` — tokens were deposited into an escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositEvent {
+    pub from: Address,
+    pub amount: i128,
+    pub funded_amount: i128,
+    pub status: ContractStatus,
+}
+
+/// `(1, "release", id)` — a milestone was paid out.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseEvent {
+    pub index: u32,
+    pub amount: i128,
+    pub to: Address,
+    pub released_amount: i128,
+    pub status: ContractStatus,
+}
+
+/// `(1, "dispute", id)` — a party opened a dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeEvent {
+    pub by: Address,
+    pub status: ContractStatus,
+}
+
+/// `(1, "resolved", id)` — a dispute was settled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedEvent {
+    pub to_freelancer: i128,
+    pub to_client: i128,
+    pub status: ContractStatus,
+}
+
+/// `(1, "cancel", id)` — the client cancelled; `refund` went back to the
+/// funders (the client, or pro-rata to sponsors, see `get_funders`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelEvent {
+    pub refund: i128,
+    pub to: Address,
+    pub status: ContractStatus,
+}
+
+/// `(1, "rep", id)` — the client rated the freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationEvent {
+    pub freelancer: Address,
+    pub rating: u32,
+    pub completed_contracts: u32,
+    pub total_rating: u32,
+    pub weight: i128,
+}
+
+/// `(1, "complete", id)` — the last milestone was released.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedEvent {
+    pub released_amount: i128,
+}
+
 /// Delegated operational roles. The admin implicitly holds every role.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,11 +669,9 @@ fn build_escrow(
         assert_solvent(&env, &c.token);
     }
     save(&env, &c);
-    env.events()
-        .publish((symbol_short!("created"), id), (client.clone(), freelancer, total));
+    events::created(&env, &c);
     if fund_now {
-        env.events()
-            .publish((symbol_short!("deposit"), id), (client, total));
+        events::deposit(&env, &c, &client, total);
     }
     Ok(id)
 }
@@ -748,8 +826,7 @@ fn settle(env: &Env, mut c: EscrowContract, freelancer_bps: u32) -> Result<(), E
         PERSISTENT_TTL_EXTEND,
     );
 
-    env.events()
-        .publish((symbol_short!("resolved"), c.id), (to_freelancer, to_client));
+    events::resolved(env, &c, to_freelancer, to_client);
     Ok(())
 }
 
@@ -814,8 +891,7 @@ fn apply_deposit(
     #[cfg(any(test, debug_assertions))]
     assert_solvent(env, &c.token);
     save(env, c);
-    env.events()
-        .publish((symbol_short!("deposit"), c.id), (funder.clone(), amount));
+    events::deposit(env, c, funder, amount);
     Ok(())
 }
 
@@ -929,7 +1005,7 @@ impl Escrow {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::NextId, &1u64);
         bump_instance(&env);
-        env.events().publish((symbol_short!("init"),), admin);
+        events::init(&env, &admin);
         Ok(())
     }
 
@@ -949,7 +1025,7 @@ impl Escrow {
         }
         env.storage().instance().set(&DataKey::Paused, &paused);
         bump_instance(&env);
-        env.events().publish((symbol_short!("paused"),), paused);
+        events::paused(&env, paused);
         Ok(())
     }
 
@@ -1227,7 +1303,8 @@ impl Escrow {
         if paid > 0 {
             clear_milestone_paid(&env, id, index);
         }
-        if c.milestones.iter().all(|x| x.released) {
+        let completed = c.milestones.iter().all(|x| x.released);
+        if completed {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
@@ -1235,8 +1312,10 @@ impl Escrow {
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
         save(&env, &c);
-        env.events()
-            .publish((symbol_short!("release"), id), (index, remaining));
+        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount);
+        if completed {
+            events::completed(&env, &c);
+        }
         Ok(())
     }
 
@@ -1277,6 +1356,7 @@ impl Escrow {
             .ok_or(EscrowError::ArithmeticOverflow)?;
         let new_paid = paid + amount;
         let remaining_after = m.amount - new_paid;
+        let mut completed = false;
         if remaining_after == 0 {
             m.released = true;
             c.milestones.set(index, m.clone());
@@ -1284,6 +1364,7 @@ impl Escrow {
             if c.milestones.iter().all(|x| x.released) {
                 transition(&mut c, ContractStatus::Completed)?;
                 record_closed_at(&env, id);
+                completed = true;
             }
         } else {
             set_milestone_paid(&env, id, index, new_paid);
@@ -1296,6 +1377,9 @@ impl Escrow {
             (symbol_short!("rel_part"), id),
             (index, amount, remaining_after),
         );
+        if completed {
+            events::completed(&env, &c);
+        }
         Ok(())
     }
 
@@ -1384,7 +1468,8 @@ impl Escrow {
             .released_amount
             .checked_add(total)
             .ok_or(EscrowError::ArithmeticOverflow)?;
-        if c.milestones.iter().all(|x| x.released) {
+        let completed = c.milestones.iter().all(|x| x.released);
+        if completed {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
@@ -1392,13 +1477,18 @@ impl Escrow {
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
         save(&env, &c);
+        let to = payee(&env, &c);
+        let mut running = c.released_amount - total;
         for (pos, index) in indices.iter().enumerate() {
             let amount = paid_now.get(pos as u32).unwrap();
-            env.events()
-                .publish((symbol_short!("release"), id), (index, amount));
+            running += amount;
+            events::release(&env, &c, index, amount, &to, running);
         }
         env.events()
             .publish((symbol_short!("rel_batch"), id), (count, total));
+        if completed {
+            events::completed(&env, &c);
+        }
         Ok(total)
     }
 
@@ -1504,7 +1594,7 @@ impl Escrow {
             PERSISTENT_TTL_EXTEND,
         );
 
-        env.events().publish((symbol_short!("dispute"), id), caller);
+        events::dispute(&env, &c, &caller);
         Ok(())
     }
 
@@ -1609,6 +1699,8 @@ impl Escrow {
             .get(&key)
             .unwrap_or_else(|| Map::new(&env));
         votes.set(member.clone(), freelancer_bps);
+        env.events()
+            .publish((symbol_short!("voted"), id), (member.clone(), freelancer_bps));
         env.storage().persistent().set(&key, &votes);
         env.storage().persistent().extend_ttl(
             &key,
@@ -1938,7 +2030,7 @@ impl Escrow {
             );
         }
 
-        env.events().publish((symbol_short!("cancel"), id), refund);
+        events::cancel(&env, &c, refund);
         Ok(())
     }
 
@@ -2015,8 +2107,7 @@ impl Escrow {
 
         c.reputation_issued = true;
         save(&env, &c);
-        env.events()
-            .publish((symbol_short!("rep"), id), (c.freelancer, rating, weight));
+        events::reputation(&env, &c, rating, &rep, weight);
         Ok(())
     }
 
@@ -2296,6 +2387,124 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Outcomes(addr))
             .unwrap_or_default()
+    }
+}
+
+/// Centralised emission of the versioned, structured events.
+mod events {
+    use super::*;
+
+    fn escrow_topic(name: Symbol, id: u64) -> (u32, Symbol, u64) {
+        (EVENT_SCHEMA_V, name, id)
+    }
+
+    pub fn init(env: &Env, admin: &Address) {
+        env.events()
+            .publish((EVENT_SCHEMA_V, symbol_short!("init")), admin.clone());
+    }
+
+    pub fn paused(env: &Env, paused: bool) {
+        env.events()
+            .publish((EVENT_SCHEMA_V, symbol_short!("paused")), paused);
+    }
+
+    pub fn created(env: &Env, c: &EscrowContract) {
+        env.events().publish(
+            escrow_topic(symbol_short!("created"), c.id),
+            CreatedEvent {
+                client: c.client.clone(),
+                freelancer: c.freelancer.clone(),
+                token: c.token.clone(),
+                total: c.total_amount,
+                milestone_count: c.milestones.len(),
+            },
+        );
+    }
+
+    pub fn deposit(env: &Env, c: &EscrowContract, from: &Address, amount: i128) {
+        env.events().publish(
+            escrow_topic(symbol_short!("deposit"), c.id),
+            DepositEvent {
+                from: from.clone(),
+                amount,
+                funded_amount: c.funded_amount,
+                status: c.status,
+            },
+        );
+    }
+
+    pub fn release(
+        env: &Env,
+        c: &EscrowContract,
+        index: u32,
+        amount: i128,
+        to: &Address,
+        released_amount: i128,
+    ) {
+        env.events().publish(
+            escrow_topic(symbol_short!("release"), c.id),
+            ReleaseEvent {
+                index,
+                amount,
+                to: to.clone(),
+                released_amount,
+                status: c.status,
+            },
+        );
+    }
+
+    pub fn completed(env: &Env, c: &EscrowContract) {
+        env.events().publish(
+            escrow_topic(symbol_short!("complete"), c.id),
+            CompletedEvent {
+                released_amount: c.released_amount,
+            },
+        );
+    }
+
+    pub fn dispute(env: &Env, c: &EscrowContract, by: &Address) {
+        env.events().publish(
+            escrow_topic(symbol_short!("dispute"), c.id),
+            DisputeEvent {
+                by: by.clone(),
+                status: c.status,
+            },
+        );
+    }
+
+    pub fn resolved(env: &Env, c: &EscrowContract, to_freelancer: i128, to_client: i128) {
+        env.events().publish(
+            escrow_topic(symbol_short!("resolved"), c.id),
+            ResolvedEvent {
+                to_freelancer,
+                to_client,
+                status: c.status,
+            },
+        );
+    }
+
+    pub fn cancel(env: &Env, c: &EscrowContract, refund: i128) {
+        env.events().publish(
+            escrow_topic(symbol_short!("cancel"), c.id),
+            CancelEvent {
+                refund,
+                to: c.client.clone(),
+                status: c.status,
+            },
+        );
+    }
+
+    pub fn reputation(env: &Env, c: &EscrowContract, rating: u32, rep: &Reputation, weight: i128) {
+        env.events().publish(
+            escrow_topic(symbol_short!("rep"), c.id),
+            ReputationEvent {
+                freelancer: c.freelancer.clone(),
+                rating,
+                completed_contracts: rep.completed_contracts,
+                total_rating: rep.total_rating,
+                weight,
+            },
+        );
     }
 }
 

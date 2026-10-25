@@ -2970,16 +2970,11 @@ fn rep_event_includes_weight() {
     let s = setup();
     let id = completed_escrow(&s, 20 * U);
     s.escrow.issue_reputation(&id, &4);
-    let events = s.env.events().all();
-    let last = events.last().unwrap();
-    assert_eq!(
-        Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap(),
-        symbol_short!("rep")
-    );
-    let (who, rating, weight) = <(Address, u32, i128)>::try_from_val(&s.env, &last.2).unwrap();
-    assert_eq!(who, s.freelancer);
-    assert_eq!(rating, 4);
-    assert_eq!(weight, 20 * U);
+    // Structured since #1712: topics (1, "rep", id), payload ReputationEvent.
+    let ev: ReputationEvent = last_escrow_event(&s, "rep", id).unwrap();
+    assert_eq!(ev.freelancer, s.freelancer);
+    assert_eq!(ev.rating, 4);
+    assert_eq!(ev.weight, 20 * U);
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,30 +4485,19 @@ fn create_and_fund_emits_created_then_deposit() {
         &s.token.address,
         &vec![&s.env, 100 * U, 50 * U],
     );
-    let mine: std::vec::Vec<_> = s
-        .env
-        .events()
-        .all()
-        .iter()
-        .filter(|e| e.0 == s.escrow.address)
-        .collect();
-    let n = mine.len();
+    // Structured since #1712: topics (1, symbol, id) with typed payloads.
+    let names = escrow_event_names(&s);
+    let n = names.len();
     assert!(n >= 2);
-    let created = &mine[n - 2];
-    let deposit = &mine[n - 1];
+    assert_eq!(names[n - 2], symbol_short!("created"));
+    assert_eq!(names[n - 1], symbol_short!("deposit"));
+    let created: CreatedEvent = last_escrow_event(&s, "created", id).unwrap();
     assert_eq!(
-        Symbol::try_from_val(&s.env, &created.1.get(0).unwrap()).unwrap(),
-        symbol_short!("created")
+        (created.client, created.freelancer, created.total),
+        (s.client.clone(), s.freelancer.clone(), 150 * U)
     );
-    assert_eq!(u64::try_from_val(&s.env, &created.1.get(1).unwrap()).unwrap(), id);
-    let (c, f, total) = <(Address, Address, i128)>::try_from_val(&s.env, &created.2).unwrap();
-    assert_eq!((c, f, total), (s.client.clone(), s.freelancer.clone(), 150 * U));
-    assert_eq!(
-        Symbol::try_from_val(&s.env, &deposit.1.get(0).unwrap()).unwrap(),
-        symbol_short!("deposit")
-    );
-    let (funder, amount) = <(Address, i128)>::try_from_val(&s.env, &deposit.2).unwrap();
-    assert_eq!((funder, amount), (s.client.clone(), 150 * U));
+    let deposit: DepositEvent = last_escrow_event(&s, "deposit", id).unwrap();
+    assert_eq!((deposit.from, deposit.amount), (s.client.clone(), 150 * U));
 }
 
 #[test]
@@ -4670,4 +4654,242 @@ fn metadata_writes_bump_ttl() {
     assert!(persistent_ttl(&s, &DataKey::MilestoneSpecs(id)) >= PERSISTENT_TTL_THRESHOLD);
     s.escrow.deliver(&id, &1, &hash32(&s.env, 4));
     assert!(persistent_ttl(&s, &DataKey::Delivery(id, 1)) >= PERSISTENT_TTL_THRESHOLD);
+}
+
+// ---------------------------------------------------------------------------
+// Versioned structured events
+// ---------------------------------------------------------------------------
+
+/// Escrow-contract events as (topics, data), in emission order.
+fn escrow_events(s: &Setup) -> std::vec::Vec<(Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    s.env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .map(|e| (e.1, e.2))
+        .collect()
+}
+
+/// Symbols of the structured (versioned) escrow events, in order.
+fn escrow_event_names(s: &Setup) -> std::vec::Vec<Symbol> {
+    escrow_events(s)
+        .iter()
+        .filter(|(topics, _)| {
+            topics.len() == 3 && u32::try_from_val(&s.env, &topics.get(0).unwrap()) == Ok(EVENT_SCHEMA_V)
+        })
+        .map(|(topics, _)| Symbol::try_from_val(&s.env, &topics.get(1).unwrap()).unwrap())
+        .collect()
+}
+
+/// Last structured event `(1, name, id)` decoded as `T`.
+fn last_escrow_event<T: TryFromVal<Env, soroban_sdk::Val>>(s: &Setup, name: &str, id: u64) -> Option<T> {
+    let want = Symbol::new(&s.env, name);
+    escrow_events(s)
+        .into_iter()
+        .rev()
+        .find(|(topics, _)| {
+            topics.len() == 3
+                && u32::try_from_val(&s.env, &topics.get(0).unwrap()) == Ok(EVENT_SCHEMA_V)
+                && Symbol::try_from_val(&s.env, &topics.get(1).unwrap()) == Ok(want.clone())
+                && u64::try_from_val(&s.env, &topics.get(2).unwrap()) == Ok(id)
+        })
+        .map(|(_, data)| T::try_from_val(&s.env, &data).ok().unwrap())
+}
+
+fn count_escrow_events(s: &Setup, name: &str) -> usize {
+    let want = Symbol::new(&s.env, name);
+    escrow_event_names(s).iter().filter(|n| **n == want).count()
+}
+
+#[test]
+fn init_and_paused_events_are_versioned() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(Escrow, ());
+    let escrow = EscrowClient::new(&env, &id);
+    escrow.initialize(&admin);
+    let ev = env.events().all().last().unwrap();
+    assert_eq!(ev.0, id);
+    assert_eq!(ev.1.len(), 2);
+    assert_eq!(u32::try_from_val(&env, &ev.1.get(0).unwrap()).unwrap(), EVENT_SCHEMA_V);
+    assert_eq!(
+        Symbol::try_from_val(&env, &ev.1.get(1).unwrap()).unwrap(),
+        symbol_short!("init")
+    );
+    assert_eq!(Address::try_from_val(&env, &ev.2).unwrap(), admin);
+
+    escrow.set_paused(&admin, &true);
+    let ev = env.events().all().last().unwrap();
+    assert_eq!(u32::try_from_val(&env, &ev.1.get(0).unwrap()).unwrap(), EVENT_SCHEMA_V);
+    assert_eq!(
+        Symbol::try_from_val(&env, &ev.1.get(1).unwrap()).unwrap(),
+        symbol_short!("paused")
+    );
+    assert!(bool::try_from_val(&env, &ev.2).unwrap());
+}
+
+#[test]
+fn created_and_deposit_events_carry_state() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    let created: CreatedEvent = last_escrow_event(&s, "created", id).unwrap();
+    assert_eq!(
+        created,
+        CreatedEvent {
+            client: s.client.clone(),
+            freelancer: s.freelancer.clone(),
+            token: s.token.address.clone(),
+            total: 300 * U,
+            milestone_count: 2,
+        }
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    let dep: DepositEvent = last_escrow_event(&s, "deposit", id).unwrap();
+    assert_eq!(
+        dep,
+        DepositEvent {
+            from: s.client.clone(),
+            amount: 100 * U,
+            funded_amount: 100 * U,
+            status: ContractStatus::Created,
+        }
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    let dep: DepositEvent = last_escrow_event(&s, "deposit", id).unwrap();
+    assert_eq!(dep.funded_amount, 300 * U);
+    assert_eq!(dep.status, ContractStatus::Funded);
+}
+
+#[test]
+fn release_events_and_complete_emitted_exactly_once() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    s.escrow.release_milestone(&id, &0);
+    let rel: ReleaseEvent = last_escrow_event(&s, "release", id).unwrap();
+    assert_eq!(
+        rel,
+        ReleaseEvent {
+            index: 0,
+            amount: 100 * U,
+            to: s.freelancer.clone(),
+            released_amount: 100 * U,
+            status: ContractStatus::Funded,
+        }
+    );
+    assert_eq!(count_escrow_events(&s, "complete"), 0);
+
+    s.escrow.release_milestone(&id, &1);
+    let rel: ReleaseEvent = last_escrow_event(&s, "release", id).unwrap();
+    assert_eq!(rel.released_amount, 300 * U);
+    assert_eq!(rel.status, ContractStatus::Completed);
+    assert_eq!(count_escrow_events(&s, "complete"), 1);
+    let done: CompletedEvent = last_escrow_event(&s, "complete", id).unwrap();
+    assert_eq!(done.released_amount, 300 * U);
+    let names = escrow_event_names(&s);
+    assert_eq!(names[names.len() - 1], symbol_short!("complete"));
+}
+
+#[test]
+fn complete_event_for_batch_and_partial_releases() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    s.escrow.release_partial(&id, &0, &(40 * U));
+    assert_eq!(count_escrow_events(&s, "complete"), 0);
+    s.escrow.release_milestones(&id, &vec![&s.env, 1u32]);
+    assert_eq!(count_escrow_events(&s, "complete"), 0);
+    s.escrow.release_partial(&id, &0, &(60 * U));
+    assert_eq!(count_escrow_events(&s, "complete"), 1);
+
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id2, &(300 * U));
+    s.escrow.release_milestones(&id2, &vec![&s.env, 0u32, 1u32]);
+    let done: CompletedEvent = last_escrow_event(&s, "complete", id2).unwrap();
+    assert_eq!(done.released_amount, 300 * U);
+    let rel: ReleaseEvent = last_escrow_event(&s, "release", id2).unwrap();
+    assert_eq!((rel.index, rel.amount, rel.released_amount), (1, 200 * U, 300 * U));
+}
+
+#[test]
+fn dispute_resolved_cancel_and_rep_events() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 400 * U],
+    );
+    s.escrow.deposit_funds(&id, &(400 * U));
+    s.escrow.open_dispute(&id, &s.freelancer);
+    let d: DisputeEvent = last_escrow_event(&s, "dispute", id).unwrap();
+    assert_eq!(
+        d,
+        DisputeEvent {
+            by: s.freelancer.clone(),
+            status: ContractStatus::Disputed,
+        }
+    );
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500);
+    let r: ResolvedEvent = last_escrow_event(&s, "resolved", id).unwrap();
+    assert_eq!(
+        r,
+        ResolvedEvent {
+            to_freelancer: 100 * U,
+            to_client: 300 * U,
+            status: ContractStatus::Resolved,
+        }
+    );
+    s.escrow.issue_reputation(&id, &4);
+    let rep: ReputationEvent = last_escrow_event(&s, "rep", id).unwrap();
+    assert_eq!(
+        rep,
+        ReputationEvent {
+            freelancer: s.freelancer.clone(),
+            rating: 4,
+            completed_contracts: 1,
+            total_rating: 4,
+            weight: 100 * U,
+        }
+    );
+
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U],
+    );
+    s.escrow.deposit_funds(&id2, &(50 * U));
+    s.escrow.cancel_contract(&id2);
+    let c: CancelEvent = last_escrow_event(&s, "cancel", id2).unwrap();
+    assert_eq!(
+        c,
+        CancelEvent {
+            refund: 50 * U,
+            to: s.client.clone(),
+            status: ContractStatus::Cancelled,
+        }
+    );
 }
