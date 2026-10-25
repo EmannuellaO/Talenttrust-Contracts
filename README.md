@@ -64,6 +64,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
 | `get_milestone_paid(id, index) -> i128` | - | Amount paid so far on a milestone (its full amount once released) |
 | `next_releasable(id) -> Option<u32>` | - | Lowest unreleased milestone index (`None` when all released) |
+| `migrate_escrows(ids) -> u32` | anyone | Eagerly move up to 50 legacy `Contract(id)` entries to the versioned `ContractV(id)` envelope (`InvalidAmount` above 50); already-migrated/unknown ids are skipped; returns the number migrated. Legacy entries are otherwise migrated lazily by their first mutation; reads never write |
 | `get_milestone(id, index)` | - | Single milestone; `MilestoneNotFound` when out of range |
 | `get_escrow_summary(id)` | - | Status and derived balances (`held`, `remaining_to_fund`, milestone counts, next unreleased index, whether the held balance covers it) |
 | `get_escrow_summaries(ids)` | - | Up to 25 summaries; unknown ids skipped, larger batches return `InvalidAmount` |

@@ -5163,7 +5163,11 @@ fn upgrade_schedule_boundary_and_execute() {
     let (stored, version, pending): (Option<EscrowContract>, Option<u32>, bool) =
         s.env.as_contract(&s.escrow.address, || {
             (
-                s.env.storage().persistent().get(&DataKey::Contract(id)),
+                s.env
+                    .storage()
+                    .persistent()
+                    .get::<_, StoredEscrow>(&DataKey::ContractV(id))
+                    .map(upgrade_to_latest),
                 s.env.storage().instance().get(&DataKey::Version),
                 s.env.storage().instance().has(&DataKey::PendingUpgrade),
             )
@@ -5217,4 +5221,160 @@ fn non_admin_cannot_schedule_cancel_or_execute_upgrade() {
     s.env.mock_all_auths();
     assert!(s.escrow.get_pending_upgrade().is_some());
     assert_eq!(s.escrow.version(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Versioned storage envelope with lazy migration
+// ---------------------------------------------------------------------------
+
+/// Plant a legacy `DataKey::Contract(id)` entry directly (pre-versioning layout).
+fn write_legacy(s: &Setup, c: &EscrowContract) {
+    s.env.as_contract(&s.escrow.address, || {
+        s.env.storage().persistent().set(&DataKey::Contract(c.id), c);
+    });
+}
+
+fn has_new_key(s: &Setup, id: u64) -> bool {
+    s.env.as_contract(&s.escrow.address, || {
+        s.env.storage().persistent().has(&DataKey::ContractV(id))
+    })
+}
+
+fn has_legacy_key(s: &Setup, id: u64) -> bool {
+    s.env.as_contract(&s.escrow.address, || {
+        s.env.storage().persistent().has(&DataKey::Contract(id))
+    })
+}
+
+fn legacy_escrow(s: &Setup, id: u64, amounts: &[i128]) -> EscrowContract {
+    let mut milestones = Vec::new(&s.env);
+    let mut total = 0;
+    for a in amounts {
+        milestones.push_back(Milestone {
+            amount: *a,
+            released: false,
+        });
+        total += *a;
+    }
+    EscrowContract {
+        id,
+        client: s.client.clone(),
+        freelancer: s.freelancer.clone(),
+        token: s.token.address.clone(),
+        milestones,
+        total_amount: total,
+        funded_amount: 0,
+        released_amount: 0,
+        refunded_amount: 0,
+        status: ContractStatus::Created,
+        reputation_issued: false,
+    }
+}
+
+#[test]
+fn legacy_entry_is_migrated_on_first_mutation() {
+    let s = setup();
+    write_legacy(&s, &legacy_escrow(&s, 99, &[100 * U]));
+    assert!(has_legacy_key(&s, 99));
+    assert!(!has_new_key(&s, 99));
+
+    // Reads work on the legacy entry and do not write.
+    let read = s.escrow.get_contract(&99u64);
+    assert_eq!(read.id, 99);
+    assert_eq!(read.status, ContractStatus::Created);
+    assert!(has_legacy_key(&s, 99));
+    assert!(!has_new_key(&s, 99));
+
+    // The first mutation migrates the entry.
+    s.escrow.deposit_funds(&99u64, &(100 * U));
+    assert!(has_new_key(&s, 99));
+    assert!(!has_legacy_key(&s, 99));
+    let after = s.escrow.get_contract(&99u64);
+    assert_eq!(after.status, ContractStatus::Funded);
+    assert_eq!(after.funded_amount, 100 * U);
+
+    s.escrow.release_milestone(&99u64, &0u32);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(
+        s.escrow.get_contract(&99u64).status,
+        ContractStatus::Completed
+    );
+}
+
+#[test]
+fn reads_on_legacy_entry_do_not_mutate_storage() {
+    let s = setup();
+    write_legacy(&s, &legacy_escrow(&s, 42, &[50 * U]));
+    let _ = s.escrow.get_contract(&42u64);
+    let _ = s.escrow.get_escrow_summary(&42u64);
+    let _ = s.escrow.get_milestone(&42u64, &0);
+    let _ = s.escrow.next_releasable(&42u64);
+    assert!(has_legacy_key(&s, 42));
+    assert!(!has_new_key(&s, 42));
+}
+
+#[test]
+fn deposit_and_release_work_on_legacy_entry() {
+    let s = setup();
+    write_legacy(&s, &legacy_escrow(&s, 77, &[200 * U, 300 * U]));
+    s.escrow.deposit_funds(&77u64, &(500 * U));
+    assert!(has_new_key(&s, 77));
+    assert!(!has_legacy_key(&s, 77));
+    assert_eq!(s.escrow.get_contract(&77u64).status, ContractStatus::Funded);
+    s.escrow.release_milestone(&77u64, &0u32);
+    s.escrow.release_milestone(&77u64, &1u32);
+    assert_eq!(s.token.balance(&s.freelancer), 500 * U);
+    assert_eq!(
+        s.escrow.get_contract(&77u64).status,
+        ContractStatus::Completed
+    );
+}
+
+#[test]
+fn migrate_escrows_is_idempotent() {
+    let s = setup();
+    write_legacy(&s, &legacy_escrow(&s, 10, &[10 * U]));
+    assert_eq!(s.escrow.migrate_escrows(&vec![&s.env, 10u64]), 1);
+    assert!(has_new_key(&s, 10));
+    assert!(!has_legacy_key(&s, 10));
+    assert_eq!(s.escrow.migrate_escrows(&vec![&s.env, 10u64]), 0);
+    let c = s.escrow.get_contract(&10u64);
+    assert_eq!(c, legacy_escrow(&s, 10, &[10 * U]));
+}
+
+#[test]
+fn migrate_escrows_skips_unknown_and_enforces_cap() {
+    let s = setup();
+    assert_eq!(s.escrow.migrate_escrows(&vec![&s.env, 9999u64]), 0);
+    let mut ids = Vec::new(&s.env);
+    for i in 1000u64..1050u64 {
+        ids.push_back(i);
+    }
+    assert_eq!(ids.len(), MAX_MIGRATE_BATCH);
+    assert_eq!(s.escrow.migrate_escrows(&ids), 0);
+    ids.push_back(2000u64);
+    assert_eq!(
+        s.escrow.try_migrate_escrows(&ids),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+}
+
+#[test]
+fn new_contracts_use_versioned_key() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 10 * U],
+    );
+    assert!(has_new_key(&s, id));
+    assert!(!has_legacy_key(&s, id));
+    // Freeze and compaction work against the versioned key too
+    s.escrow.freeze_escrow(&id, &symbol_short!("check"));
+    s.escrow.unfreeze_escrow(&id);
+    s.escrow.cancel_contract(&id);
+    s.escrow.compact_escrow(&id);
+    assert!(!has_new_key(&s, id));
+    assert!(s.escrow.get_receipt(&id).is_some());
 }
