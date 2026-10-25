@@ -4538,3 +4538,136 @@ fn create_and_fund_uses_fewer_write_bytes_than_two_step() {
     );
     assert!(one_step.write_entries < create_res.write_entries + deposit_res.write_entries);
 }
+
+// ---------------------------------------------------------------------------
+// Terms and delivery hashes
+// ---------------------------------------------------------------------------
+
+fn hash32(env: &Env, seed: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[seed; 32])
+}
+
+fn two_milestone_escrow(s: &Setup) -> u64 {
+    s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    )
+}
+
+fn persistent_ttl<K: IntoVal<Env, soroban_sdk::Val>>(s: &Setup, key: &K) -> u32 {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    s.env
+        .as_contract(&s.escrow.address, || s.env.storage().persistent().get_ttl(key))
+}
+
+#[test]
+fn set_terms_then_fund_succeeds() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    let specs = vec![&s.env, hash32(&s.env, 2), hash32(&s.env, 3)];
+    s.escrow.set_terms(&id, &hash32(&s.env, 1), &specs);
+    assert_eq!(s.escrow.get_terms(&id), Some((hash32(&s.env, 1), specs.clone())));
+    s.escrow.deposit_funds(&id, &(300 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    // Terms without milestone specs are accepted too
+    let id2 = two_milestone_escrow(&s);
+    s.escrow.set_terms(&id2, &hash32(&s.env, 9), &Vec::new(&s.env));
+    assert_eq!(
+        s.escrow.get_terms(&id2),
+        Some((hash32(&s.env, 9), Vec::new(&s.env)))
+    );
+    assert_eq!(s.escrow.get_terms(&99), None);
+}
+
+#[test]
+fn set_terms_after_deposit_rejected() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    s.escrow.deposit_funds(&id, &(10 * U));
+    assert_eq!(
+        s.escrow.try_set_terms(&id, &hash32(&s.env, 1), &Vec::new(&s.env)),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn set_terms_length_mismatch_rejected() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    assert_eq!(
+        s.escrow
+            .try_set_terms(&id, &hash32(&s.env, 1), &vec![&s.env, hash32(&s.env, 2)]),
+        Err(Ok(EscrowError::InvalidMetadata))
+    );
+}
+
+#[test]
+fn deliver_recorded_and_overwritable_until_release() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    s.escrow.deposit_funds(&id, &(300 * U));
+    assert_eq!(s.escrow.get_delivery(&id, &0), None);
+    s.escrow.deliver(&id, &0, &hash32(&s.env, 5));
+    assert_eq!(s.escrow.get_delivery(&id, &0), Some(hash32(&s.env, 5)));
+    s.escrow.deliver(&id, &0, &hash32(&s.env, 6));
+    assert_eq!(s.escrow.get_delivery(&id, &0), Some(hash32(&s.env, 6)));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(
+        s.escrow.try_deliver(&id, &0, &hash32(&s.env, 7)),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    assert_eq!(
+        s.escrow.try_deliver(&id, &5, &hash32(&s.env, 7)),
+        Err(Ok(EscrowError::MilestoneNotFound))
+    );
+}
+
+#[test]
+fn client_cannot_deliver_and_freelancer_cannot_set_terms() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    let h = hash32(&s.env, 1);
+    s.env.mock_auths(&[MockAuth {
+        address: &s.client,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "deliver",
+            args: (id, 0u32, h.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_deliver(&id, &0, &h).is_err());
+    s.env.mock_auths(&[MockAuth {
+        address: &s.freelancer,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "set_terms",
+            args: (id, h.clone(), Vec::<BytesN<32>>::new(&s.env)).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s
+        .escrow
+        .try_set_terms(&id, &h, &Vec::new(&s.env))
+        .is_err());
+    s.env.mock_all_auths();
+    assert_eq!(s.escrow.get_delivery(&id, &0), None);
+    assert_eq!(s.escrow.get_terms(&id), None);
+}
+
+#[test]
+fn metadata_writes_bump_ttl() {
+    let s = setup();
+    let id = two_milestone_escrow(&s);
+    s.escrow.set_terms(
+        &id,
+        &hash32(&s.env, 1),
+        &vec![&s.env, hash32(&s.env, 2), hash32(&s.env, 3)],
+    );
+    assert!(persistent_ttl(&s, &DataKey::Terms(id)) >= PERSISTENT_TTL_THRESHOLD);
+    assert!(persistent_ttl(&s, &DataKey::MilestoneSpecs(id)) >= PERSISTENT_TTL_THRESHOLD);
+    s.escrow.deliver(&id, &1, &hash32(&s.env, 4));
+    assert!(persistent_ttl(&s, &DataKey::Delivery(id, 1)) >= PERSISTENT_TTL_THRESHOLD);
+}

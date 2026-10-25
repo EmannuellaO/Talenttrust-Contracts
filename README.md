@@ -45,6 +45,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `propose_change_order(id, amounts)` | client | Propose extra milestones for a `Created`/`Funded`/`Completed` escrow (`existing + new <= 20`, else `InvalidMilestones`) |
 | `accept_change_order(id) -> (u32, i128)` | freelancer | Append the proposed milestones, grow `total_amount` and reopen the escrow as `Created` (needs funding; a fresh funding window starts); emits `("chg_ord", id) -> (added_count, added_total)`. A rating already issued stays issued, so `issue_reputation` remains blocked for that escrow |
 | `reject_change_order(id)` / `get_change_order(id)` | freelancer / - | Drop / read the pending proposal (`ChangeOrderNotFound` (`37`) if none) |
+| `set_terms(id, terms_hash, milestone_hashes)` | client | Commit a 32-byte terms hash and 0 or one spec hash per milestone (`InvalidMetadata` (`38`) otherwise); only while `Created` with nothing deposited (frozen afterwards, `InvalidStatus`); emits `("terms", id) -> terms_hash` |
+| `deliver(id, index, delivery_hash)` | freelancer | Record/overwrite a milestone's delivery hash until it is released; emits `("deliver", id) -> (index, delivery_hash)` |
 | `expire_unfunded(id)` | anyone | After the 14-day funding window (`FUNDING_WINDOW_SECS`), cancel an escrow still `Created` with nothing released and refund any partial deposit to its funders; emits `("expired", id) -> refund`. `NotExpired` (`36`) before the deadline |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
@@ -67,6 +69,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_reputation_score(addr) -> Option<u32>` | - | Value-weighted average rating ×100 (e.g. `437` = 4.37), rounded half up; `None` without eligible ratings |
 | `get_weighted_reputation(addr)` | - | `WeightedReputation { weighted_rating_sum, weight_total, rated_contracts }` (weight = released amount) |
 | `get_client_reputation(addr)` | - | Client reputation accumulated from freelancer ratings |
+| `get_terms(id)`, `get_delivery(id, index)` | - | Committed terms/spec hashes and recorded delivery hashes |
 | `get_fund_by(id) -> u64` | - | Funding deadline (ledger timestamp; `0` if none) |
 | `get_funders(id)` | - | Map of funder -> contribution |
 | `get_panel()`, `get_votes(id)` | - | Current arbiter panel and the votes on a disputed escrow (cleared after settlement) |
@@ -146,6 +149,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 35 | `FundingExpired` | deposit into a `Created` escrow after its funding deadline |
 | 36 | `NotExpired` | `expire_unfunded` at or before the funding deadline |
 | 37 | `ChangeOrderNotFound` | `accept_change_order` / `reject_change_order` without a pending proposal |
+| 38 | `InvalidMetadata` | `set_terms` — milestone hash count is neither 0 nor the milestone count |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

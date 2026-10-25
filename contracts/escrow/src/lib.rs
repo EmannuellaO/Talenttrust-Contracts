@@ -15,7 +15,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Map, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, Map, Symbol,
     Vec,
 };
 
@@ -94,6 +94,7 @@ pub enum EscrowError {
     FundingExpired = 35,
     NotExpired = 36,
     ChangeOrderNotFound = 37,
+    InvalidMetadata = 38,
 }
 
 #[contracttype]
@@ -245,6 +246,9 @@ enum DataKey {
     FundBy(u64),
     ChangeOrder(u64),
     MilestonePaid(u64, u32),
+    Terms(u64),
+    MilestoneSpecs(u64),
+    Delivery(u64, u32),
 }
 
 #[contract]
@@ -1761,6 +1765,93 @@ impl Escrow {
     /// Pending change order amounts for an escrow, if any.
     pub fn get_change_order(env: Env, id: u64) -> Option<Vec<i128>> {
         env.storage().persistent().get(&DataKey::ChangeOrder(id))
+    }
+
+    /// Client commits a hash of the agreed job terms plus optional per-milestone
+    /// deliverable spec hashes (0 or one per milestone, else `InvalidMetadata`).
+    /// Only while `Created` with nothing deposited; frozen afterwards
+    /// (`InvalidStatus`). Emits `("terms", id) -> terms_hash`.
+    pub fn set_terms(
+        env: Env,
+        id: u64,
+        terms_hash: BytesN<32>,
+        milestone_hashes: Vec<BytesN<32>>,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.client.require_auth();
+        if c.status != ContractStatus::Created || c.funded_amount != 0 {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let n = milestone_hashes.len();
+        if n != 0 && n != c.milestones.len() {
+            return Err(EscrowError::InvalidMetadata);
+        }
+        let terms_key = DataKey::Terms(id);
+        env.storage().persistent().set(&terms_key, &terms_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&terms_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        let specs_key = DataKey::MilestoneSpecs(id);
+        env.storage().persistent().set(&specs_key, &milestone_hashes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&specs_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("terms"), id), terms_hash);
+        Ok(())
+    }
+
+    /// Freelancer records a delivery hash for a milestone; it may be overwritten
+    /// until the milestone is released. Emits `("deliver", id) -> (index, hash)`.
+    pub fn deliver(
+        env: Env,
+        id: u64,
+        index: u32,
+        delivery_hash: BytesN<32>,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        let key = DataKey::Delivery(id, index);
+        env.storage().persistent().set(&key, &delivery_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("deliver"), id), (index, delivery_hash));
+        Ok(())
+    }
+
+    /// Terms hash and per-milestone spec hashes, if committed.
+    pub fn get_terms(env: Env, id: u64) -> Option<(BytesN<32>, Vec<BytesN<32>>)> {
+        let terms: BytesN<32> = env.storage().persistent().get(&DataKey::Terms(id))?;
+        let specs: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneSpecs(id))
+            .unwrap_or_else(|| Vec::new(&env));
+        Some((terms, specs))
+    }
+
+    /// Delivery hash recorded for a milestone, if any.
+    pub fn get_delivery(env: Env, id: u64, index: u32) -> Option<BytesN<32>> {
+        env.storage().persistent().get(&DataKey::Delivery(id, index))
     }
 
     /// Anyone may expire an escrow that is still `Created` (not fully funded,
