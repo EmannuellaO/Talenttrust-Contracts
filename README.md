@@ -38,8 +38,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `release_partial(id, index, amount)` | client | Pay part of a milestone (`InvalidAmount` if `amount <= 0` or above the remaining amount, `InsufficientFunds` if not enough is held); when fully paid the milestone is released. `release_milestone` / `release_milestones` pay only the remaining amount. Emits `("rel_part", id) -> (index, amount, remaining)` |
 | `release_milestones(id, indices) -> i128` | client | Release several milestones in one call (all-or-nothing, one payout, one save); emits a `release` event per milestone plus `("rel_batch", id) -> (count, total)`; `DuplicateIndex` (`29`) on repeated indices |
 | `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
-| `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution (increments `disputes_opened`) |
-| `resolve_dispute(caller, id, freelancer_bps)` | admin or Resolver | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold); the resolver cannot be the escrow's client or freelancer |
+| `open_dispute(id, caller)` | client or freelancer | Post a refundable bond of `max(DISPUTE_BOND_MIN, total * DISPUTE_BOND_BPS / 10_000)` (`DISPUTE_BOND_BPS = 200`, `DISPUTE_BOND_MIN = 0`) and freeze the escrow pending resolution (increments `disputes_opened`) |
+| `resolve_dispute(caller, id, freelancer_bps, bond_to_opener)` | admin or Resolver | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold); the resolver cannot be the escrow's client or freelancer; the dispute bond is never part of the split — it returns to the opener when `bond_to_opener`, otherwise goes to the counterparty (panel settlements return it to the opener only if the split favours them) |
 | `set_panel(members, threshold)` | admin | Replace the arbiter panel (1 <= threshold <= len <= 7, unique members, else `InvalidPanel` (`31`)); emits `("panel",) -> (len, threshold)` |
 | `vote_resolution(member, id, freelancer_bps)` | panel member | Vote a split on a disputed escrow; re-votes replace earlier ones, parties cannot vote, only current members are tallied. When `threshold` members agree the escrow settles like `resolve_dispute` and one `("vote", id) -> (member, bps)` event per counted vote is emitted |
 | `propose_change_order(id, amounts)` | client | Propose extra milestones for a `Created`/`Funded`/`Completed` escrow (`existing + new <= 20`, else `InvalidMilestones`) |
@@ -71,6 +71,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_client_reputation(addr)` | - | Client reputation accumulated from freelancer ratings |
 | `get_terms(id)`, `get_delivery(id, index)` | - | Committed terms/spec hashes and recorded delivery hashes |
 | `get_fund_by(id) -> u64` | - | Funding deadline (ledger timestamp; `0` if none) |
+| `get_dispute_bond(id) -> Option<(Address, i128)>` | - | Opener and amount of the bond held for a disputed escrow |
 | `get_funders(id)` | - | Map of funder -> contribution |
 | `get_panel()`, `get_votes(id)` | - | Current arbiter panel and the votes on a disputed escrow (cleared after settlement) |
 | `get_receipt(id) -> Option<EscrowReceipt>` | - | Receipt of a compacted escrow; `get_contract` on a compacted id returns `EscrowCompacted` (`26`) |
@@ -108,8 +109,8 @@ Core lifecycle events are versioned and structured: escrow events use topics
 | deposit | `(1, "deposit", id)` | `DepositEvent { from, amount, funded_amount, status }` | `deposit_funds`, `deposit_from`, `create_and_fund` |
 | release | `(1, "release", id)` | `ReleaseEvent { index, amount, to, released_amount, status }` | `release_milestone`, `release_milestones` (one per milestone) |
 | complete | `(1, "complete", id)` | `CompletedEvent { released_amount }` | exactly once, when the last milestone is released (single, batch or partial release) |
-| dispute | `(1, "dispute", id)` | `DisputeEvent { by, status }` | `open_dispute` |
-| resolved | `(1, "resolved", id)` | `ResolvedEvent { to_freelancer, to_client, status }` | `resolve_dispute`, panel settlement |
+| dispute | `(1, "dispute", id)` | `DisputeEvent { by, status, bond }` | `open_dispute` |
+| resolved | `(1, "resolved", id)` | `ResolvedEvent { to_freelancer, to_client, status, bond_recipient, bond }` | `resolve_dispute`, panel settlement |
 | cancel | `(1, "cancel", id)` | `CancelEvent { refund, to, status }` (`to` is the client; refunds go pro-rata to funders) | `cancel_contract` |
 | rep | `(1, "rep", id)` | `ReputationEvent { freelancer, rating, completed_contracts, total_rating, weight }` | `issue_reputation` |
 
