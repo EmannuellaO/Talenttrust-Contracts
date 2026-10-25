@@ -30,6 +30,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
 | `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract`, but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
+| `deposit_from(id, funder, amount)` | funder | Any address funds the escrow (same checks as `deposit_funds`); contributions are tracked per funder (max 10, else `TooManyFunders` (`34`)) and refunds from `cancel_contract` / the client share of a dispute are split pro-rata among funders, rounding remainder to the largest funder. `deposit` event payload is `(funder, amount)` |
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
 | `release_milestone(id, index)` | client | Pay the milestone to the team split if set, otherwise the freelancer (or their payout address) |
 | `set_payout_address(id, payout)` | freelancer | Route payouts to a separate address; `Created`/`Funded` only, not during dispute |
@@ -59,6 +60,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_reputation_score(addr) -> Option<u32>` | - | Value-weighted average rating ×100 (e.g. `437` = 4.37), rounded half up; `None` without eligible ratings |
 | `get_weighted_reputation(addr)` | - | `WeightedReputation { weighted_rating_sum, weight_total, rated_contracts }` (weight = released amount) |
 | `get_client_reputation(addr)` | - | Client reputation accumulated from freelancer ratings |
+| `get_funders(id)` | - | Map of funder -> contribution |
 | `get_panel()`, `get_votes(id)` | - | Current arbiter panel and the votes on a disputed escrow (cleared after settlement) |
 | `get_receipt(id) -> Option<EscrowReceipt>` | - | Receipt of a compacted escrow; `get_contract` on a compacted id returns `EscrowCompacted` (`26`) |
 | `get_payout_address(id)` | - | Payout address for an escrow (falls back to the freelancer) |
@@ -131,6 +133,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 31 | `InvalidPanel` | `set_panel` — bad threshold/size or duplicate members |
 | 32 | `PanelRequired` | `resolve_dispute` on an escrow with `total_amount >= PANEL_THRESHOLD_AMOUNT` (10^12) — settle via `vote_resolution` |
 | 33 | `RoleUnchanged` | `grant_role` on an existing member / `revoke_role` on a non-member |
+| 34 | `TooManyFunders` | `deposit_funds` / `deposit_from` by an 11th distinct funder |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
