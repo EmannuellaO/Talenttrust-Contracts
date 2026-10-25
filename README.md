@@ -35,6 +35,10 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
 | `release_milestone(id, index)` | client | Pay the milestone to the team split if set, otherwise the freelancer (or their payout address) |
 | `set_payout_address(id, payout)` | freelancer | Route payouts to a separate address; `Created`/`Funded` only, not during dispute |
+| `create_contract_with_review(client, freelancer, token, milestone_amounts, review_window_secs) -> u64` | client | `create_contract` with a custom review window (1 hour to 30 days, else `InvalidReviewWindow` (`41`)); other create calls use the 7-day default |
+| `submit_milestone(id, index)` | freelancer | Mark a `Pending` milestone of a `Funded` escrow as delivered (its unpaid amount must be covered by the uncommitted balance); emits `("submit", id) -> (index, submitted_at)` |
+| `claim_milestone(id, index)` | freelancer | Auto-release a submitted milestone once `now >= submitted_at + review_window` (`ReviewWindowActive` (`43`) before, `MilestoneNotSubmitted` (`42`) if not submitted); not while `Disputed`; also after a cancel. Emits `("claim", id) -> (index, amount)` and a `release` event |
+| `get_milestone_status(id, index)`, `get_submitted_at(id, index)`, `get_review_window(id)` | - | `MilestoneStatus { Pending, Submitted, Released }`, submission time and review window |
 | `release_partial(id, index, amount)` | client | Pay part of a milestone (`InvalidAmount` if `amount <= 0` or above the remaining amount, `InsufficientFunds` if not enough is held); when fully paid the milestone is released. `release_milestone` / `release_milestones` pay only the remaining amount. Emits `("rel_part", id) -> (index, amount, remaining)` |
 | `release_milestones(id, indices) -> i128` | client | Release several milestones in one call (all-or-nothing, one payout, one save); emits a `release` event per milestone plus `("rel_batch", id) -> (count, total)`; `DuplicateIndex` (`29`) on repeated indices |
 | `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
@@ -48,7 +52,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `set_terms(id, terms_hash, milestone_hashes)` | client | Commit a 32-byte terms hash and 0 or one spec hash per milestone (`InvalidMetadata` (`38`) otherwise); only while `Created` with nothing deposited (frozen afterwards, `InvalidStatus`); emits `("terms", id) -> terms_hash` |
 | `deliver(id, index, delivery_hash)` | freelancer | Record/overwrite a milestone's delivery hash until it is released; emits `("deliver", id) -> (index, delivery_hash)` |
 | `expire_unfunded(id)` | anyone | After the 14-day funding window (`FUNDING_WINDOW_SECS`), cancel an escrow still `Created` with nothing released and refund any partial deposit to its funders; emits `("expired", id) -> refund`. `NotExpired` (`36`) before the deadline |
-| `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
+| `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held); funds backing submitted milestones stay in escrow for the freelancer to claim |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
 | `rate_client(id, rating)` | freelancer | Rate the client of a completed or resolved job (1-5), once; emits `("rep_cli", id) -> (client, rating)` |
 | `void_rating(id, reason)` | admin | Void a fraudulent rating, reverse reputation and emit audit trail |
@@ -178,6 +182,9 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 38 | `InvalidMetadata` | `set_terms` — milestone hash count is neither 0 nor the milestone count |
 | 39 | `NoPendingUpgrade` | `cancel_upgrade` / `execute_upgrade` with nothing scheduled |
 | 40 | `UpgradeNotReady` | `execute_upgrade` before the scheduled `eta` |
+| 41 | `InvalidReviewWindow` | `create_contract_with_review` outside 1 hour..30 days |
+| 42 | `MilestoneNotSubmitted` | `claim_milestone` on a milestone that was not submitted |
+| 43 | `ReviewWindowActive` | `claim_milestone` before the review window elapsed |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

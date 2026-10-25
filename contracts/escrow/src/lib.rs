@@ -32,6 +32,13 @@ pub const MAX_MIGRATE_BATCH: u32 = 50;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// 48-hour time-lock delay before a scheduled WASM upgrade can be executed.
 pub const UPGRADE_DELAY_SECS: u64 = 172_800;
+/// Minimum review window after a milestone submission: 1 hour.
+pub const MIN_REVIEW_WINDOW_SECS: u64 = 3_600;
+/// Maximum review window after a milestone submission: 30 days.
+pub const MAX_REVIEW_WINDOW_SECS: u64 = 30 * 86_400;
+/// Review window used by `create_contract` / `create_contract_sequential` /
+/// `create_and_fund` (7 days); `create_contract_with_review` sets a custom one.
+pub const DEFAULT_REVIEW_WINDOW_SECS: u64 = 7 * 86_400;
 /// Funding window after creation (14 days); afterwards an escrow still in
 /// `Created` can no longer be funded and may be expired by anyone.
 pub const FUNDING_WINDOW_SECS: u64 = 14 * 86_400;
@@ -111,6 +118,9 @@ pub enum EscrowError {
     InvalidMetadata = 38,
     NoPendingUpgrade = 39,
     UpgradeNotReady = 40,
+    InvalidReviewWindow = 41,
+    MilestoneNotSubmitted = 42,
+    ReviewWindowActive = 43,
 }
 
 #[contracttype]
@@ -187,6 +197,20 @@ pub struct EscrowReceipt {
 pub struct Reputation {
     pub completed_contracts: u32,
     pub total_rating: u32,
+}
+
+/// Per-milestone lifecycle state (`get_milestone_status`). Tracked beside the
+/// stored `Milestone` (whose `released` flag stays authoritative) so the stored
+/// escrow layout does not change.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MilestoneStatus {
+    /// Not submitted yet.
+    Pending,
+    /// Freelancer submitted; awaiting approval or review-window expiry.
+    Submitted,
+    /// Paid to the freelancer.
+    Released,
 }
 
 /// Versioned storage envelope for `EscrowContract`. Every new layout adds a
@@ -379,6 +403,9 @@ enum DataKey {
     PendingUpgrade,
     /// Current versioned key: `StoredEscrow` envelope.
     ContractV(u64),
+    /// Ledger timestamp at which the freelancer submitted a milestone.
+    Submitted(u64, u32),
+    ReviewWindow(u64),
 }
 
 #[contract]
@@ -661,6 +688,7 @@ fn build_escrow(
     token: Address,
     milestone_amounts: Vec<i128>,
     fund_now: bool,
+    review_window_secs: u64,
 ) -> Result<u64, EscrowError> {
     let admin_addr = admin(&env)?;
     require_not_paused(&env)?;
@@ -711,6 +739,13 @@ fn build_escrow(
     env.storage()
         .persistent()
         .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    if review_window_secs != DEFAULT_REVIEW_WINDOW_SECS {
+        let rw_key = DataKey::ReviewWindow(id);
+        env.storage().persistent().set(&rw_key, &review_window_secs);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rw_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+    }
     let mut c = EscrowContract {
         id,
         client: client.clone(),
@@ -786,6 +821,41 @@ fn clear_milestone_paid(env: &Env, id: u64, index: u32) {
     env.storage()
         .persistent()
         .remove(&DataKey::MilestonePaid(id, index));
+}
+
+fn submitted_at(env: &Env, id: u64, index: u32) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Submitted(id, index))
+}
+
+fn clear_submitted(env: &Env, id: u64, index: u32) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Submitted(id, index));
+}
+
+/// Unpaid amount still backing submitted (not yet released) milestones. These
+/// funds are committed to the freelancer and are never refunded by a cancel.
+fn submitted_backing(env: &Env, c: &EscrowContract) -> Result<i128, EscrowError> {
+    let mut total: i128 = 0;
+    for (i, m) in c.milestones.iter().enumerate() {
+        let index = i as u32;
+        if !m.released && submitted_at(env, c.id, index).is_some() {
+            let remaining = m.amount - milestone_paid(env, c.id, index);
+            total = total
+                .checked_add(remaining)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+        }
+    }
+    Ok(total)
+}
+
+fn review_window(env: &Env, id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReviewWindow(id))
+        .unwrap_or(DEFAULT_REVIEW_WINDOW_SECS)
 }
 
 fn is_sequential(env: &Env, id: u64) -> bool {
@@ -1268,7 +1338,32 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        build_escrow(env, client, freelancer, token, milestone_amounts, false)
+        build_escrow(env, client, freelancer, token, milestone_amounts, false, DEFAULT_REVIEW_WINDOW_SECS)
+    }
+
+    /// Same as `create_contract` with a custom review window for submitted
+    /// milestones (`MIN_REVIEW_WINDOW_SECS..=MAX_REVIEW_WINDOW_SECS`, i.e. 1 hour
+    /// to 30 days, else `InvalidReviewWindow`).
+    pub fn create_contract_with_review(
+        env: Env,
+        client: Address,
+        freelancer: Address,
+        token: Address,
+        milestone_amounts: Vec<i128>,
+        review_window_secs: u64,
+    ) -> Result<u64, EscrowError> {
+        if !(MIN_REVIEW_WINDOW_SECS..=MAX_REVIEW_WINDOW_SECS).contains(&review_window_secs) {
+            return Err(EscrowError::InvalidReviewWindow);
+        }
+        build_escrow(
+            env,
+            client,
+            freelancer,
+            token,
+            milestone_amounts,
+            false,
+            review_window_secs,
+        )
     }
 
     /// Validates, creates and fully funds an escrow in one call (one client
@@ -1281,7 +1376,7 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        build_escrow(env, client, freelancer, token, milestone_amounts, true)
+        build_escrow(env, client, freelancer, token, milestone_amounts, true, DEFAULT_REVIEW_WINDOW_SECS)
     }
 
     /// Creates an escrow whose milestones must be released strictly in order
@@ -1293,7 +1388,15 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        let id = build_escrow(env.clone(), client, freelancer, token, milestone_amounts, false)?;
+        let id = build_escrow(
+            env.clone(),
+            client,
+            freelancer,
+            token,
+            milestone_amounts,
+            false,
+            DEFAULT_REVIEW_WINDOW_SECS,
+        )?;
         let key = DataKey::Sequential(id);
         env.storage().persistent().set(&key, &true);
         env.storage()
@@ -1390,7 +1493,135 @@ impl Escrow {
             .unwrap_or_else(|| Map::new(&env))
     }
 
-    /// Client approves a milestone and the freelancer is paid.
+    /// Freelancer marks a milestone as delivered, starting the review clock.
+    /// The escrow must be `Funded`, the milestone `Pending`, and its unpaid
+    /// amount covered by `funded - released - (already submitted backing)`.
+    /// Emits `("submit", id) -> (index, submitted_at)`.
+    pub fn submit_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        if c.status != ContractStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released || submitted_at(&env, id, index).is_some() {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        let remaining = m.amount - milestone_paid(&env, id, index);
+        let available = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .and_then(|v| v.checked_sub(submitted_backing(&env, &c).ok()?))
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if available < remaining {
+            return Err(EscrowError::InsufficientFunds);
+        }
+        let now = env.ledger().timestamp();
+        let key = DataKey::Submitted(id, index);
+        env.storage().persistent().set(&key, &now);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("submit"), id), (index, now));
+        Ok(())
+    }
+
+    /// Freelancer claims a submitted milestone once its review window has
+    /// elapsed (`now >= submitted_at + review_window`). Not available while the
+    /// escrow is `Disputed`; still available after the client cancelled, since
+    /// submitted funds are kept in escrow. Emits `("claim", id) -> (index, amount)`.
+    pub fn claim_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(c.status, ContractStatus::Funded | ContractStatus::Cancelled) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let mut m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        let at = submitted_at(&env, id, index).ok_or(EscrowError::MilestoneNotSubmitted)?;
+        let release_after = at
+            .checked_add(review_window(&env, id))
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if env.ledger().timestamp() < release_after {
+            return Err(EscrowError::ReviewWindowActive);
+        }
+        let paid = milestone_paid(&env, id, index);
+        let remaining = m.amount - paid;
+        if c.funded_amount - c.released_amount < remaining {
+            return Err(EscrowError::InsufficientFunds);
+        }
+        pay_out(&env, &c, remaining);
+        m.released = true;
+        c.released_amount = c
+            .released_amount
+            .checked_add(remaining)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        c.milestones.set(index, m);
+        if paid > 0 {
+            clear_milestone_paid(&env, id, index);
+        }
+        clear_submitted(&env, id, index);
+        let completed =
+            c.status == ContractStatus::Funded && c.milestones.iter().all(|x| x.released);
+        if completed {
+            transition(&mut c, ContractStatus::Completed)?;
+            record_closed_at(&env, id);
+        }
+        sub_liability(&env, &c.token, remaining)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("claim"), id), (index, remaining));
+        events::release(&env, &c, index, remaining, &payee(&env, &c), c.released_amount);
+        if completed {
+            events::completed(&env, &c);
+        }
+        Ok(())
+    }
+
+    /// Lifecycle state of a milestone: `Pending`, `Submitted` or `Released`.
+    pub fn get_milestone_status(env: Env, id: u64, index: u32) -> Result<MilestoneStatus, EscrowError> {
+        let c = load(&env, id)?;
+        let m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        Ok(if m.released {
+            MilestoneStatus::Released
+        } else if submitted_at(&env, id, index).is_some() {
+            MilestoneStatus::Submitted
+        } else {
+            MilestoneStatus::Pending
+        })
+    }
+
+    /// Submission timestamp of a milestone, if submitted and not yet released.
+    pub fn get_submitted_at(env: Env, id: u64, index: u32) -> Option<u64> {
+        submitted_at(&env, id, index)
+    }
+
+    /// Review window (seconds) applied to submitted milestones of an escrow.
+    pub fn get_review_window(env: Env, id: u64) -> Result<u64, EscrowError> {
+        load(&env, id)?;
+        Ok(review_window(&env, id))
+    }
+
+    /// Client approves a milestone and the freelancer is paid (accepts both
+    /// `Pending` and `Submitted` milestones).
     pub fn release_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
@@ -1425,6 +1656,7 @@ impl Escrow {
         if paid > 0 {
             clear_milestone_paid(&env, id, index);
         }
+        clear_submitted(&env, id, index);
         let completed = c.milestones.iter().all(|x| x.released);
         if completed {
             transition(&mut c, ContractStatus::Completed)?;
@@ -1483,6 +1715,7 @@ impl Escrow {
             m.released = true;
             c.milestones.set(index, m.clone());
             clear_milestone_paid(&env, id, index);
+            clear_submitted(&env, id, index);
             if c.milestones.iter().all(|x| x.released) {
                 transition(&mut c, ContractStatus::Completed)?;
                 record_closed_at(&env, id);
@@ -1585,6 +1818,7 @@ impl Escrow {
             if paid_now.get(pos as u32).unwrap() != m.amount {
                 clear_milestone_paid(&env, id, index);
             }
+            clear_submitted(&env, id, index);
         }
         c.released_amount = c
             .released_amount
@@ -2123,7 +2357,9 @@ impl Escrow {
             .unwrap_or(0)
     }
 
-    /// Client cancels the agreement and recovers any unreleased funds.
+    /// Client cancels the agreement and recovers unreleased funds, except the
+    /// funds backing milestones the freelancer already submitted: those stay in
+    /// escrow, claimable via `claim_milestone` once the review window elapses.
     /// If any funds were held and refunded, cancellations is incremented for the client.
     pub fn cancel_contract(env: Env, id: u64) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
@@ -2133,10 +2369,16 @@ impl Escrow {
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
         }
-        let refund = c.funded_amount - c.released_amount;
+        // Funds backing submitted milestones stay in escrow for the freelancer.
+        let held = c.funded_amount - c.released_amount;
+        let committed = submitted_backing(&env, &c)?.min(held);
+        let refund = held - committed;
         refund_funders(&env, &c, refund)?;
         c.refunded_amount = refund;
-        c.funded_amount = c.released_amount;
+        c.funded_amount = c
+            .funded_amount
+            .checked_sub(refund)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         transition(&mut c, ContractStatus::Cancelled)?;
         record_closed_at(&env, id);
         sub_liability(&env, &c.token, refund)?;
@@ -2431,7 +2673,12 @@ impl Escrow {
         let now = u64::from(env.ledger().sequence());
         let closed_at: Option<u64> = env.storage().persistent().get(&DataKey::ClosedAt(id));
         match c.status {
-            ContractStatus::Cancelled => {}
+            ContractStatus::Cancelled => {
+                // Submitted milestones may still be claimable after a cancel.
+                if c.funded_amount != c.released_amount {
+                    return Err(EscrowError::NotCompactable);
+                }
+            }
             ContractStatus::Completed | ContractStatus::Resolved => {
                 if !c.reputation_issued {
                     let closed = closed_at.ok_or(EscrowError::NotCompactable)?;

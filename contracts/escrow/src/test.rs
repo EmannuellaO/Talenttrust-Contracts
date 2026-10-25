@@ -5378,3 +5378,241 @@ fn new_contracts_use_versioned_key() {
     assert!(!has_new_key(&s, id));
     assert!(s.escrow.get_receipt(&id).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Milestone submission, review window and auto-release
+// ---------------------------------------------------------------------------
+
+fn funded_two_milestones(s: &Setup) -> u64 {
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    id
+}
+
+#[test]
+fn cancel_after_submission_cannot_claw_back_submitted_work() {
+    // Attack: freelancer delivers milestone 0, client cancels in the same ledger.
+    // Before this change the client was refunded everything.
+    let s = setup();
+    let id = funded_two_milestones(&s);
+    s.escrow.submit_milestone(&id, &0);
+    assert_eq!(s.escrow.get_milestone_status(&id, &0), MilestoneStatus::Submitted);
+    s.escrow.cancel_contract(&id);
+    // Only the pending milestone (200) is refunded; 100 stays for the freelancer.
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 100 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 100 * U);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Cancelled);
+    assert_eq!(c.refunded_amount, 200 * U);
+    // Not compactable while submitted funds are outstanding.
+    assert_eq!(
+        s.escrow.try_compact_escrow(&id),
+        Err(Ok(EscrowError::NotCompactable))
+    );
+    // The freelancer claims once the review window has passed.
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &0),
+        Err(Ok(EscrowError::ReviewWindowActive))
+    );
+    s.env
+        .ledger()
+        .with_mut(|li| li.timestamp += DEFAULT_REVIEW_WINDOW_SECS);
+    s.escrow.claim_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Cancelled);
+    check_invariants(&s.escrow.get_contract(&id));
+}
+
+#[test]
+fn claim_after_review_window_completes_escrow() {
+    let s = setup();
+    let id = s.escrow.create_contract_with_review(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+        &MIN_REVIEW_WINDOW_SECS,
+    );
+    assert_eq!(s.escrow.get_review_window(&id), MIN_REVIEW_WINDOW_SECS);
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.env.ledger().with_mut(|li| li.timestamp = 5_000);
+    s.escrow.submit_milestone(&id, &0);
+    assert_eq!(s.escrow.get_submitted_at(&id, &0), Some(5_000));
+    s.env
+        .ledger()
+        .with_mut(|li| li.timestamp = 5_000 + MIN_REVIEW_WINDOW_SECS - 1);
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &0),
+        Err(Ok(EscrowError::ReviewWindowActive))
+    );
+    s.env
+        .ledger()
+        .with_mut(|li| li.timestamp = 5_000 + MIN_REVIEW_WINDOW_SECS);
+    s.escrow.claim_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.escrow.get_milestone_status(&id, &0), MilestoneStatus::Released);
+    assert_eq!(s.escrow.get_submitted_at(&id, &0), None);
+}
+
+#[test]
+fn review_window_bounds_validated() {
+    let s = setup();
+    for bad in [MIN_REVIEW_WINDOW_SECS - 1, MAX_REVIEW_WINDOW_SECS + 1] {
+        assert_eq!(
+            s.escrow.try_create_contract_with_review(
+                &s.client,
+                &s.freelancer,
+                &s.token.address,
+                &vec![&s.env, 100 * U],
+                &bad,
+            ),
+            Err(Ok(EscrowError::InvalidReviewWindow))
+        );
+    }
+    let id = s.escrow.create_contract_with_review(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+        &MAX_REVIEW_WINDOW_SECS,
+    );
+    assert_eq!(s.escrow.get_review_window(&id), MAX_REVIEW_WINDOW_SECS);
+    let id2 = funded_two_milestones(&s);
+    assert_eq!(s.escrow.get_review_window(&id2), DEFAULT_REVIEW_WINDOW_SECS);
+}
+
+#[test]
+fn submit_milestone_failure_paths() {
+    let s = setup();
+    // Not funded yet
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    assert_eq!(
+        s.escrow.try_submit_milestone(&id, &0),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    // Out of range
+    assert_eq!(
+        s.escrow.try_submit_milestone(&id, &5),
+        Err(Ok(EscrowError::MilestoneNotFound))
+    );
+    // Wrong caller: only the client authorises
+    s.env.mock_auths(&[MockAuth {
+        address: &s.client,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "submit_milestone",
+            args: (id, 0u32).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_submit_milestone(&id, &0).is_err());
+    s.env.mock_all_auths();
+    // Paused
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(
+        s.escrow.try_submit_milestone(&id, &0),
+        Err(Ok(EscrowError::Paused))
+    );
+    s.escrow.set_paused(&s.admin, &false);
+    // Double submit and submit after release
+    s.escrow.submit_milestone(&id, &0);
+    assert_eq!(
+        s.escrow.try_submit_milestone(&id, &0),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(
+        s.escrow.try_submit_milestone(&id, &1),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+}
+
+#[test]
+fn claim_milestone_failure_paths() {
+    let s = setup();
+    let id = funded_two_milestones(&s);
+    // Not submitted
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &0),
+        Err(Ok(EscrowError::MilestoneNotSubmitted))
+    );
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &9),
+        Err(Ok(EscrowError::MilestoneNotFound))
+    );
+    s.escrow.submit_milestone(&id, &0);
+    s.env
+        .ledger()
+        .with_mut(|li| li.timestamp += DEFAULT_REVIEW_WINDOW_SECS);
+    // Wrong caller
+    s.env.mock_auths(&[MockAuth {
+        address: &s.client,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "claim_milestone",
+            args: (id, 0u32).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_claim_milestone(&id, &0).is_err());
+    s.env.mock_all_auths();
+    // Paused
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &0),
+        Err(Ok(EscrowError::Paused))
+    );
+    s.escrow.set_paused(&s.admin, &false);
+    // Disputed escrows freeze claims
+    open_dispute_bonded(&s, &id, &s.client);
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &0),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn client_release_accepts_submitted_and_claim_after_release_fails() {
+    let s = setup();
+    let id = funded_two_milestones(&s);
+    s.escrow.submit_milestone(&id, &1);
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(s.escrow.get_milestone_status(&id, &1), MilestoneStatus::Released);
+    s.env
+        .ledger()
+        .with_mut(|li| li.timestamp += DEFAULT_REVIEW_WINDOW_SECS);
+    assert_eq!(
+        s.escrow.try_claim_milestone(&id, &1),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    // Pending milestones can still be paid early
+    assert_eq!(s.escrow.get_milestone_status(&id, &0), MilestoneStatus::Pending);
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.token.balance(&s.freelancer), 300 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn cancel_without_submissions_is_unchanged() {
+    let s = setup();
+    let id = funded_two_milestones(&s);
+    s.escrow.cancel_contract(&id);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.funded_amount, c.released_amount);
+    check_invariants(&c);
+}
