@@ -5058,3 +5058,163 @@ fn sweep_cannot_take_dispute_bonds() {
         Err(Ok(EscrowError::NoSurplus))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Time-locked WASM upgrades
+// ---------------------------------------------------------------------------
+
+/// A minimal, code-free Wasm module that the host accepts as contract code:
+/// just the Wasm header plus the `contractenvmetav0` custom section declaring
+/// interface version (protocol 21, pre-release 0). Built from readable parts
+/// so the fixture is fully transparent; it exports no functions.
+fn minimal_contract_wasm() -> std::vec::Vec<u8> {
+    let name = b"contractenvmetav0";
+    // XDR ScEnvMetaEntry::InterfaceVersion { protocol: 21, pre_release: 0 }
+    let mut payload = std::vec::Vec::new();
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&21u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let mut section = std::vec::Vec::new();
+    section.push(name.len() as u8);
+    section.extend_from_slice(name);
+    section.extend_from_slice(&payload);
+    let mut wasm = std::vec::Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&1u32.to_le_bytes());
+    wasm.push(0); // custom section id
+    wasm.push(section.len() as u8);
+    wasm.extend_from_slice(&section);
+    wasm
+}
+
+fn set_time(env: &Env, ts: u64) {
+    env.ledger().with_mut(|li| li.timestamp = ts);
+}
+
+fn last_global_event(s: &Setup) -> (Vec<soroban_sdk::Val>, soroban_sdk::Val) {
+    let ev = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .last()
+        .unwrap();
+    (ev.1, ev.2)
+}
+
+#[test]
+fn upgrade_schedule_boundary_and_execute() {
+    let s = setup();
+    assert_eq!(s.escrow.version(), 1);
+    // Existing escrow data must survive the upgrade.
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    let before = s.escrow.get_contract(&id);
+
+    let hash = s
+        .env
+        .deployer()
+        .upload_contract_wasm(soroban_sdk::Bytes::from_slice(&s.env, &minimal_contract_wasm()));
+    set_time(&s.env, 1_000);
+    s.escrow.schedule_upgrade(&hash);
+    let (topics, data) = last_global_event(&s);
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &topics.get(0).unwrap()).unwrap(),
+        symbol_short!("upg_sched")
+    );
+    let eta = 1_000 + UPGRADE_DELAY_SECS;
+    assert_eq!(
+        <(BytesN<32>, u64)>::try_from_val(&s.env, &data).unwrap(),
+        (hash.clone(), eta)
+    );
+    assert_eq!(
+        s.escrow.get_pending_upgrade(),
+        Some(PendingUpgrade {
+            wasm_hash: hash.clone(),
+            eta,
+        })
+    );
+
+    set_time(&s.env, eta - 1);
+    assert_eq!(
+        s.escrow.try_execute_upgrade(),
+        Err(Ok(EscrowError::UpgradeNotReady))
+    );
+
+    set_time(&s.env, eta);
+    s.escrow.execute_upgrade();
+    let (topics, data) = last_global_event(&s);
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &topics.get(0).unwrap()).unwrap(),
+        symbol_short!("upgraded")
+    );
+    assert_eq!(
+        <(BytesN<32>, u32)>::try_from_val(&s.env, &data).unwrap(),
+        (hash, 2)
+    );
+
+    // The instance now runs the new code; storage is untouched and readable.
+    let (stored, version, pending): (Option<EscrowContract>, Option<u32>, bool) =
+        s.env.as_contract(&s.escrow.address, || {
+            (
+                s.env.storage().persistent().get(&DataKey::Contract(id)),
+                s.env.storage().instance().get(&DataKey::Version),
+                s.env.storage().instance().has(&DataKey::PendingUpgrade),
+            )
+        });
+    assert_eq!(stored, Some(before));
+    assert_eq!(version, Some(2));
+    assert!(!pending);
+}
+
+#[test]
+fn cancel_upgrade_then_execute_fails() {
+    let s = setup();
+    assert_eq!(
+        s.escrow.try_cancel_upgrade(),
+        Err(Ok(EscrowError::NoPendingUpgrade))
+    );
+    assert_eq!(
+        s.escrow.try_execute_upgrade(),
+        Err(Ok(EscrowError::NoPendingUpgrade))
+    );
+    let hash = BytesN::from_array(&s.env, &[7u8; 32]);
+    s.escrow.schedule_upgrade(&hash);
+    s.escrow.cancel_upgrade();
+    let (topics, data) = last_global_event(&s);
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &topics.get(0).unwrap()).unwrap(),
+        symbol_short!("upg_cncl")
+    );
+    assert_eq!(BytesN::<32>::try_from_val(&s.env, &data).unwrap(), hash);
+    assert_eq!(s.escrow.get_pending_upgrade(), None);
+    set_time(&s.env, UPGRADE_DELAY_SECS * 2);
+    assert_eq!(
+        s.escrow.try_execute_upgrade(),
+        Err(Ok(EscrowError::NoPendingUpgrade))
+    );
+    assert_eq!(s.escrow.version(), 1);
+}
+
+#[test]
+fn non_admin_cannot_schedule_cancel_or_execute_upgrade() {
+    let s = setup();
+    let hash = BytesN::from_array(&s.env, &[9u8; 32]);
+    s.env.mock_auths(&[]);
+    assert!(s.escrow.try_schedule_upgrade(&hash).is_err());
+    s.env.mock_all_auths();
+    s.escrow.schedule_upgrade(&hash);
+    set_time(&s.env, UPGRADE_DELAY_SECS * 2);
+    s.env.mock_auths(&[]);
+    assert!(s.escrow.try_cancel_upgrade().is_err());
+    assert!(s.escrow.try_execute_upgrade().is_err());
+    s.env.mock_all_auths();
+    assert!(s.escrow.get_pending_upgrade().is_some());
+    assert_eq!(s.escrow.version(), 1);
+}
