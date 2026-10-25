@@ -244,6 +244,7 @@ enum DataKey {
     Funders(u64),
     FundBy(u64),
     ChangeOrder(u64),
+    MilestonePaid(u64, u32),
 }
 
 #[contract]
@@ -583,6 +584,29 @@ fn checked_milestone_total(amounts: &Vec<i128>) -> Result<i128, EscrowError> {
         total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
     }
     Ok(total)
+}
+
+/// Amount already paid on a not-yet-released milestone through `release_partial`.
+fn milestone_paid(env: &Env, id: u64, index: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MilestonePaid(id, index))
+        .unwrap_or(0)
+}
+
+fn set_milestone_paid(env: &Env, id: u64, index: u32, paid: i128) {
+    let key = DataKey::MilestonePaid(id, index);
+    env.storage().persistent().set(&key, &paid);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
+/// Clears partial-payment tracking once a milestone is fully released.
+fn clear_milestone_paid(env: &Env, id: u64, index: u32) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MilestonePaid(id, index));
 }
 
 fn is_sequential(env: &Env, id: u64) -> bool {
@@ -1146,24 +1170,105 @@ impl Escrow {
         if is_sequential(&env, id) && first_unreleased(&c) != Some(index) {
             return Err(EscrowError::OutOfOrder);
         }
-        if c.funded_amount - c.released_amount < m.amount {
+        // Only the remaining amount of a partially paid milestone is paid now.
+        let paid = milestone_paid(&env, id, index);
+        let remaining = m.amount - paid;
+        if c.funded_amount - c.released_amount < remaining {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, m.amount);
+        pay_out(&env, &c, remaining);
         m.released = true;
-        c.released_amount += m.amount;
+        c.released_amount = c
+            .released_amount
+            .checked_add(remaining)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         c.milestones.set(index, m.clone());
+        if paid > 0 {
+            clear_milestone_paid(&env, id, index);
+        }
         if c.milestones.iter().all(|x| x.released) {
             transition(&mut c, ContractStatus::Completed)?;
             record_closed_at(&env, id);
         }
-        sub_liability(&env, &c.token, m.amount)?;
+        sub_liability(&env, &c.token, remaining)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
         save(&env, &c);
         env.events()
-            .publish((symbol_short!("release"), id), (index, m.amount));
+            .publish((symbol_short!("release"), id), (index, remaining));
         Ok(())
+    }
+
+    /// Client releases any portion of a milestone (e.g. 50% on draft, 50% on
+    /// final). The paid amount is tracked per milestone; once it reaches the
+    /// milestone amount the milestone is released and completion is checked.
+    /// Emits `("rel_part", id) -> (index, amount, remaining)`.
+    pub fn release_partial(env: Env, id: u64, index: u32, amount: i128) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.client.require_auth();
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let mut m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released {
+            return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        if is_sequential(&env, id) && first_unreleased(&c) != Some(index) {
+            return Err(EscrowError::OutOfOrder);
+        }
+        let paid = milestone_paid(&env, id, index);
+        let remaining = m.amount - paid;
+        if amount <= 0 || amount > remaining {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if c.funded_amount - c.released_amount < amount {
+            return Err(EscrowError::InsufficientFunds);
+        }
+        pay_out(&env, &c, amount);
+        c.released_amount = c
+            .released_amount
+            .checked_add(amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        let new_paid = paid + amount;
+        let remaining_after = m.amount - new_paid;
+        if remaining_after == 0 {
+            m.released = true;
+            c.milestones.set(index, m.clone());
+            clear_milestone_paid(&env, id, index);
+            if c.milestones.iter().all(|x| x.released) {
+                transition(&mut c, ContractStatus::Completed)?;
+                record_closed_at(&env, id);
+            }
+        } else {
+            set_milestone_paid(&env, id, index, new_paid);
+        }
+        sub_liability(&env, &c.token, amount)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        env.events().publish(
+            (symbol_short!("rel_part"), id),
+            (index, amount, remaining_after),
+        );
+        Ok(())
+    }
+
+    /// How much of a milestone has been paid so far (its full amount once released).
+    pub fn get_milestone_paid(env: Env, id: u64, index: u32) -> Result<i128, EscrowError> {
+        let c = load(&env, id)?;
+        let m = c
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        if m.released {
+            return Ok(m.amount);
+        }
+        Ok(milestone_paid(&env, id, index))
     }
 
     /// Client approves several milestones in one call: all indices are
@@ -1183,6 +1288,7 @@ impl Escrow {
         }
 
         let mut total: i128 = 0;
+        let mut paid_now: Vec<i128> = Vec::new(&env);
         for (pos, index) in indices.iter().enumerate() {
             for earlier in indices.iter().take(pos) {
                 if earlier == index {
@@ -1196,8 +1302,10 @@ impl Escrow {
             if m.released {
                 return Err(EscrowError::MilestoneAlreadyReleased);
             }
+            let remaining = m.amount - milestone_paid(&env, id, index);
+            paid_now.push_back(remaining);
             total = total
-                .checked_add(m.amount)
+                .checked_add(remaining)
                 .ok_or(EscrowError::ArithmeticOverflow)?;
         }
 
@@ -1223,10 +1331,13 @@ impl Escrow {
         }
 
         pay_out(&env, &c, total);
-        for index in indices.iter() {
+        for (pos, index) in indices.iter().enumerate() {
             let mut m = c.milestones.get(index).unwrap();
             m.released = true;
-            c.milestones.set(index, m);
+            c.milestones.set(index, m.clone());
+            if paid_now.get(pos as u32).unwrap() != m.amount {
+                clear_milestone_paid(&env, id, index);
+            }
         }
         c.released_amount = c
             .released_amount
@@ -1240,8 +1351,8 @@ impl Escrow {
         #[cfg(any(test, debug_assertions))]
         assert_solvent(&env, &c.token);
         save(&env, &c);
-        for index in indices.iter() {
-            let amount = c.milestones.get(index).unwrap().amount;
+        for (pos, index) in indices.iter().enumerate() {
+            let amount = paid_now.get(pos as u32).unwrap();
             env.events()
                 .publish((symbol_short!("release"), id), (index, amount));
         }

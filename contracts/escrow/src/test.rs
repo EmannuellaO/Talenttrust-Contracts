@@ -4219,3 +4219,167 @@ fn change_order_rejected_while_disputed_or_too_small() {
         Err(Ok(EscrowError::InvalidStatus))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Partial milestone releases
+// ---------------------------------------------------------------------------
+
+fn assert_invariants(s: &Setup, c: &EscrowContract) {
+    assert!(c.released_amount <= c.funded_amount);
+    let mut total_paid: i128 = 0;
+    for (i, m) in c.milestones.iter().enumerate() {
+        let paid: i128 = s.escrow.get_milestone_paid(&c.id, &(i as u32));
+        assert!(paid <= m.amount, "milestone {i} paid exceeds amount");
+        if m.released {
+            assert_eq!(paid, m.amount, "milestone {i} released but underpaid");
+        }
+        total_paid = total_paid.checked_add(paid).unwrap();
+    }
+    assert!(total_paid <= c.total_amount);
+}
+
+#[test]
+fn partial_release_completes_milestone_and_escrow() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+
+    s.escrow.release_partial(&id, &0, &(30 * U));
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    assert_eq!(s.token.balance(&s.freelancer), 30 * U);
+    assert_eq!(s.escrow.get_milestone_paid(&id, &0), 30 * U);
+
+    s.escrow.release_partial(&id, &0, &(70 * U));
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.escrow.get_milestone_paid(&id, &0), 100 * U);
+}
+
+#[test]
+fn partial_then_release_milestone_pays_remaining() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+
+    s.escrow.release_partial(&id, &0, &(30 * U));
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+
+    s.escrow.release_milestone(&id, &0);
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.escrow.get_milestone_paid(&id, &0), 100 * U);
+}
+
+#[test]
+fn over_release_is_rejected() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+
+    s.escrow.release_partial(&id, &0, &(30 * U));
+    assert_eq!(
+        s.escrow.try_release_partial(&id, &0, &(80 * U)),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    assert_eq!(s.token.balance(&s.freelancer), 30 * U);
+    assert_eq!(s.escrow.get_milestone_paid(&id, &0), 30 * U);
+
+    // fully paying via release_milestone then releasing again is rejected
+    s.escrow.release_milestone(&id, &0);
+    assert!(s.escrow.try_release_milestone(&id, &0).is_err());
+    assert!(s.escrow.try_release_partial(&id, &0, &U).is_err());
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+}
+
+#[test]
+fn zero_or_negative_partial_release_is_rejected() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+
+    assert_eq!(
+        s.escrow.try_release_partial(&id, &0, &0),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    assert_eq!(
+        s.escrow.try_release_partial(&id, &0, &-5i128),
+        Err(Ok(EscrowError::InvalidAmount))
+    );
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+}
+
+#[test]
+fn cancel_after_partial_refunds_funded_minus_released() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+    let client_before = s.token.balance(&s.client);
+
+    s.escrow.release_partial(&id, &0, &(30 * U));
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+
+    s.escrow.cancel_contract(&id);
+    assert_eq!(s.token.balance(&s.client), client_before + 70 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Cancelled);
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+}
+
+#[test]
+fn resolve_dispute_after_partial_splits_held_remainder() {
+    let s = setup();
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &vec![&s.env, 100 * U]);
+    s.escrow.deposit_funds(&id, &(100 * U));
+
+    s.escrow.release_partial(&id, &0, &(30 * U));
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+
+    s.escrow.open_dispute(&id, &s.freelancer);
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500);
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+    // held = 100 - 30 = 70 units; freelancer gets 70 * 2500 / 10000 = 17.5, client 52.5
+    assert_eq!(s.token.balance(&s.freelancer), 30 * U + 70 * U / 4);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 100 * U + (70 * U - 70 * U / 4));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+}
+
+#[test]
+fn partial_release_respects_sequential_order_and_batch_pays_remaining() {
+    let s = setup();
+    let id = s.escrow.create_contract_sequential(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(200 * U));
+    assert_eq!(
+        s.escrow.try_release_partial(&id, &1, &(10 * U)),
+        Err(Ok(EscrowError::OutOfOrder))
+    );
+    s.escrow.release_partial(&id, &0, &(40 * U));
+    let paid = s
+        .escrow
+        .release_milestones(&id, &vec![&s.env, 0u32, 1u32]);
+    assert_eq!(paid, 160 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 200 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    assert_invariants(&s, &s.escrow.get_contract(&id));
+}
