@@ -494,13 +494,16 @@ fn pay_out(env: &Env, c: &EscrowContract, amount: i128) {
     }
 }
 
-/// Shared builder for `create_contract` and `create_contract_sequential`.
+/// Shared builder for `create_contract`, `create_contract_sequential` and
+/// `create_and_fund`. With `fund_now` the full total is transferred from the
+/// client and the escrow is written once, already `Funded`.
 fn build_escrow(
     env: Env,
     client: Address,
     freelancer: Address,
     token: Address,
     milestone_amounts: Vec<i128>,
+    fund_now: bool,
 ) -> Result<u64, EscrowError> {
     let admin_addr = admin(&env)?;
     require_not_paused(&env)?;
@@ -551,7 +554,7 @@ fn build_escrow(
     env.storage()
         .persistent()
         .extend_ttl(&fund_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
-    let c = EscrowContract {
+    let mut c = EscrowContract {
         id,
         client: client.clone(),
         freelancer: freelancer.clone(),
@@ -564,9 +567,30 @@ fn build_escrow(
         status: ContractStatus::Created,
         reputation_issued: false,
     };
+    if fund_now {
+        transfer(&env, &c.token, &client, &contract_addr, total);
+        let mut funders: Map<Address, i128> = Map::new(&env);
+        funders.set(client.clone(), total);
+        let funders_key = DataKey::Funders(id);
+        env.storage().persistent().set(&funders_key, &funders);
+        env.storage().persistent().extend_ttl(
+            &funders_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
+        c.funded_amount = total;
+        transition(&mut c, ContractStatus::Funded)?;
+        add_liability(&env, &c.token, total)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+    }
     save(&env, &c);
     env.events()
-        .publish((symbol_short!("created"), id), (client, freelancer, total));
+        .publish((symbol_short!("created"), id), (client.clone(), freelancer, total));
+    if fund_now {
+        env.events()
+            .publish((symbol_short!("deposit"), id), (client, total));
+    }
     Ok(id)
 }
 
@@ -1042,7 +1066,20 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        build_escrow(env, client, freelancer, token, milestone_amounts)
+        build_escrow(env, client, freelancer, token, milestone_amounts, false)
+    }
+
+    /// Validates, creates and fully funds an escrow in one call (one client
+    /// signature, one escrow write). Same validation as `create_contract`;
+    /// emits `created` then `deposit` with the same payloads as the two-step flow.
+    pub fn create_and_fund(
+        env: Env,
+        client: Address,
+        freelancer: Address,
+        token: Address,
+        milestone_amounts: Vec<i128>,
+    ) -> Result<u64, EscrowError> {
+        build_escrow(env, client, freelancer, token, milestone_amounts, true)
     }
 
     /// Creates an escrow whose milestones must be released strictly in order
@@ -1054,7 +1091,7 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        let id = build_escrow(env.clone(), client, freelancer, token, milestone_amounts)?;
+        let id = build_escrow(env.clone(), client, freelancer, token, milestone_amounts, false)?;
         let key = DataKey::Sequential(id);
         env.storage().persistent().set(&key, &true);
         env.storage()

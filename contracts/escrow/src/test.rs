@@ -4383,3 +4383,158 @@ fn partial_release_respects_sequential_order_and_batch_pays_remaining() {
     assert_eq!(s.escrow.get_liability(&s.token.address), 0);
     assert_invariants(&s, &s.escrow.get_contract(&id));
 }
+
+// ---------------------------------------------------------------------------
+// Atomic create_and_fund
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_and_fund_matches_two_step_field_by_field() {
+    let s = setup();
+    let amounts = vec![&s.env, 100 * U, 200 * U];
+    let two_step = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &amounts);
+    s.escrow.deposit_funds(&two_step, &(300 * U));
+    let one_step = s
+        .escrow
+        .create_and_fund(&s.client, &s.freelancer, &s.token.address, &amounts);
+    assert_ne!(one_step, two_step);
+
+    let a = s.escrow.get_contract(&two_step);
+    let b = s.escrow.get_contract(&one_step);
+    assert_eq!(b.client, a.client);
+    assert_eq!(b.freelancer, a.freelancer);
+    assert_eq!(b.token, a.token);
+    assert_eq!(b.milestones, a.milestones);
+    assert_eq!(b.total_amount, a.total_amount);
+    assert_eq!(b.funded_amount, a.funded_amount);
+    assert_eq!(b.released_amount, a.released_amount);
+    assert_eq!(b.refunded_amount, a.refunded_amount);
+    assert_eq!(b.status, ContractStatus::Funded);
+    assert_eq!(b.status, a.status);
+    assert_eq!(b.reputation_issued, a.reputation_issued);
+    assert_eq!(s.escrow.get_funders(&one_step), s.escrow.get_funders(&two_step));
+    assert_eq!(s.escrow.get_fund_by(&one_step), s.escrow.get_fund_by(&two_step));
+    assert_eq!(s.token.balance(&s.client), 400 * U);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 600 * U);
+    check_invariants(&b);
+
+    // The funded escrow behaves like any other
+    s.escrow.release_milestone(&one_step, &0);
+    s.escrow.release_milestone(&one_step, &1);
+    assert_eq!(
+        s.escrow.get_contract(&one_step).status,
+        ContractStatus::Completed
+    );
+}
+
+#[test]
+fn create_and_fund_insufficient_balance_stores_nothing() {
+    let s = setup();
+    let poor = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &s.token.address).mint(&poor, &(10 * U));
+    let before = s.escrow.contract_count();
+    assert!(s
+        .escrow
+        .try_create_and_fund(
+            &poor,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 100 * U]
+        )
+        .is_err());
+    assert_eq!(s.escrow.contract_count(), before);
+    assert_eq!(s.token.balance(&poor), 10 * U);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+}
+
+#[test]
+fn create_and_fund_validation_matches_create_contract() {
+    let s = setup();
+    let cases = [
+        (s.client.clone(), s.client.clone(), vec![&s.env, 100 * U]),
+        (s.client.clone(), s.freelancer.clone(), Vec::new(&s.env)),
+        (s.client.clone(), s.freelancer.clone(), vec![&s.env, 1i128]),
+        (s.admin.clone(), s.freelancer.clone(), vec![&s.env, 100 * U]),
+    ];
+    for (client, freelancer, amounts) in cases.iter() {
+        let expected = s
+            .escrow
+            .try_create_contract(client, freelancer, &s.token.address, amounts);
+        assert!(expected.is_err());
+        assert_eq!(
+            s.escrow
+                .try_create_and_fund(client, freelancer, &s.token.address, amounts),
+            expected
+        );
+    }
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(
+        s.escrow.try_create_and_fund(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 100 * U]
+        ),
+        Err(Ok(EscrowError::Paused))
+    );
+}
+
+#[test]
+fn create_and_fund_emits_created_then_deposit() {
+    let s = setup();
+    let id = s.escrow.create_and_fund(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 50 * U],
+    );
+    let mine: std::vec::Vec<_> = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|e| e.0 == s.escrow.address)
+        .collect();
+    let n = mine.len();
+    assert!(n >= 2);
+    let created = &mine[n - 2];
+    let deposit = &mine[n - 1];
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &created.1.get(0).unwrap()).unwrap(),
+        symbol_short!("created")
+    );
+    assert_eq!(u64::try_from_val(&s.env, &created.1.get(1).unwrap()).unwrap(), id);
+    let (c, f, total) = <(Address, Address, i128)>::try_from_val(&s.env, &created.2).unwrap();
+    assert_eq!((c, f, total), (s.client.clone(), s.freelancer.clone(), 150 * U));
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &deposit.1.get(0).unwrap()).unwrap(),
+        symbol_short!("deposit")
+    );
+    let (funder, amount) = <(Address, i128)>::try_from_val(&s.env, &deposit.2).unwrap();
+    assert_eq!((funder, amount), (s.client.clone(), 150 * U));
+}
+
+#[test]
+fn create_and_fund_uses_fewer_write_bytes_than_two_step() {
+    let s = setup();
+    let amounts = vec![&s.env, 100 * U, 200 * U];
+    let id = s
+        .escrow
+        .create_contract(&s.client, &s.freelancer, &s.token.address, &amounts);
+    let create_res = s.env.cost_estimate().resources();
+    s.escrow.deposit_funds(&id, &(300 * U));
+    let deposit_res = s.env.cost_estimate().resources();
+    s.escrow
+        .create_and_fund(&s.client, &s.freelancer, &s.token.address, &amounts);
+    let one_step = s.env.cost_estimate().resources();
+    let two_step_write_bytes = create_res.write_bytes + deposit_res.write_bytes;
+    assert!(
+        one_step.write_bytes < two_step_write_bytes,
+        "one-step write_bytes {} must be < two-step {}",
+        one_step.write_bytes,
+        two_step_write_bytes
+    );
+    assert!(one_step.write_entries < create_res.write_entries + deposit_res.write_entries);
+}
