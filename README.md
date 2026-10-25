@@ -102,6 +102,10 @@ Resolved jobs allow reputation rating; dispute outcomes and cancellation metrics
 
 Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not change the escrow status or accounting.
 
+### Token transfers
+
+Every transfer into or out of the contract (deposits, releases, refunds, dispute splits and bonds, sweeps) is balance-delta checked: the contract's balance must change by exactly the requested amount, otherwise the call fails with `TransferAmountMismatch` and fully reverts. Fee-on-transfer, rebasing and no-op tokens are therefore rejected rather than silently under-collateralising other escrows of the same token.
+
 ### Events
 
 Core lifecycle events are versioned and structured: escrow events use topics
@@ -185,6 +189,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 41 | `InvalidReviewWindow` | `create_contract_with_review` outside 1 hour..30 days |
 | 42 | `MilestoneNotSubmitted` | `claim_milestone` on a milestone that was not submitted |
 | 43 | `ReviewWindowActive` | `claim_milestone` before the review window elapsed |
+| 44 | `TransferAmountMismatch` | any token transfer into/out of the contract that does not move the contract balance by exactly the requested amount (fee-on-transfer, rebasing or no-op tokens are rejected) |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

@@ -121,6 +121,9 @@ pub enum EscrowError {
     InvalidReviewWindow = 41,
     MilestoneNotSubmitted = 42,
     ReviewWindowActive = 43,
+    /// The token moved a different amount than requested (fee-on-transfer,
+    /// rebasing or misreporting token); see `transfer_checked`.
+    TransferAmountMismatch = 44,
 }
 
 #[contracttype]
@@ -556,10 +559,43 @@ fn bump_instance(env: &Env) {
         .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
 }
 
-fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amount: i128) {
-    if amount > 0 {
-        token::Client::new(env, token_addr).transfer(from, to, &amount);
+/// Transfers `amount` and, whenever the contract is on either side, verifies
+/// its token balance moved by exactly `amount`. Fee-on-transfer, rebasing or
+/// misreporting tokens would otherwise let recorded balances drift above what
+/// the contract holds, and later payouts would spend other escrows' tokens.
+/// Any mismatch fails with `TransferAmountMismatch`, reverting the whole call.
+fn transfer_checked(
+    env: &Env,
+    token_addr: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), EscrowError> {
+    if amount <= 0 {
+        return Ok(());
     }
+    let this = env.current_contract_address();
+    let client = token::Client::new(env, token_addr);
+    let touches_contract = *from == this || *to == this;
+    let before = if touches_contract {
+        client.balance(&this)
+    } else {
+        0
+    };
+    client.transfer(from, to, &amount);
+    if touches_contract {
+        let after = client.balance(&this);
+        let delta = if *to == this {
+            after.checked_sub(before)
+        } else {
+            before.checked_sub(after)
+        }
+        .ok_or(EscrowError::TransferAmountMismatch)?;
+        if delta != amount {
+            return Err(EscrowError::TransferAmountMismatch);
+        }
+    }
+    Ok(())
 }
 
 // Liability helper functions: aggregate per-token amount the contract owes to live escrows.
@@ -645,9 +681,14 @@ fn team_split(env: &Env, id: u64) -> Vec<(Address, u32)> {
 /// Distributes `amount` across fixed basis-point shares. Each share is rounded
 /// down and the remainder is added to the first (lead) payee, so the sum of all
 /// transfers is always exactly `amount`.
-fn distribute(env: &Env, token_addr: &Address, payees: &Vec<(Address, u32)>, amount: i128) {
+fn distribute(
+    env: &Env,
+    token_addr: &Address,
+    payees: &Vec<(Address, u32)>,
+    amount: i128,
+) -> Result<(), EscrowError> {
     if amount <= 0 || payees.is_empty() {
-        return;
+        return Ok(());
     }
     let mut floor_total: i128 = 0;
     for (_, bps) in payees.iter() {
@@ -662,19 +703,20 @@ fn distribute(env: &Env, token_addr: &Address, payees: &Vec<(Address, u32)>, amo
             share += remainder;
             is_lead = false;
         }
-        transfer(env, token_addr, &this, &payee, share);
+        transfer_checked(env, token_addr, &this, &payee, share)?;
     }
+    Ok(())
 }
 
 /// Pays a freelancer-side `amount` to the configured team split, or to the
 /// freelancer's payout address (see `payee`) when no split is configured.
-fn pay_out(env: &Env, c: &EscrowContract, amount: i128) {
+fn pay_out(env: &Env, c: &EscrowContract, amount: i128) -> Result<(), EscrowError> {
     let payees = team_split(env, c.id);
     if payees.is_empty() {
         let this = env.current_contract_address();
-        transfer(env, &c.token, &this, &payee(env, c), amount);
+        transfer_checked(env, &c.token, &this, &payee(env, c), amount)
     } else {
-        distribute(env, &c.token, &payees, amount);
+        distribute(env, &c.token, &payees, amount)
     }
 }
 
@@ -760,7 +802,7 @@ fn build_escrow(
         reputation_issued: false,
     };
     if fund_now {
-        transfer(&env, &c.token, &client, &contract_addr, total);
+        transfer_checked(&env, &c.token, &client, &contract_addr, total)?;
         let mut funders: Map<Address, i128> = Map::new(&env);
         funders.set(client.clone(), total);
         let funders_key = DataKey::Funders(id);
@@ -920,7 +962,7 @@ fn settle(
     let held = c.funded_amount - c.released_amount;
     let to_freelancer = held * freelancer_bps as i128 / BPS_DENOMINATOR;
     let to_client = held - to_freelancer;
-    pay_out(env, &c, to_freelancer);
+    pay_out(env, &c, to_freelancer)?;
     refund_funders(env, &c, to_client)?;
     c.released_amount += to_freelancer;
     c.refunded_amount = to_client;
@@ -952,7 +994,7 @@ fn settle(
         } else {
             c.freelancer.clone()
         };
-        transfer(env, &c.token, &env.current_contract_address(), &recipient, amount);
+        transfer_checked(env, &c.token, &env.current_contract_address(), &recipient, amount)?;
         sub_liability(env, &c.token, amount)?;
         #[cfg(any(test, debug_assertions))]
         assert_solvent(env, &c.token);
@@ -1065,7 +1107,7 @@ fn apply_deposit(
         .checked_add(amount)
         .ok_or(EscrowError::ArithmeticOverflow)?;
     funders.set(funder.clone(), contribution);
-    transfer(env, &c.token, funder, &env.current_contract_address(), amount);
+    transfer_checked(env, &c.token, funder, &env.current_contract_address(), amount)?;
     env.storage().persistent().set(&key, &funders);
     env.storage()
         .persistent()
@@ -1098,7 +1140,7 @@ fn refund_funders(env: &Env, c: &EscrowContract, refund: i128) -> Result<(), Esc
         .unwrap_or_else(|| Map::new(env));
     let total_funded = c.funded_amount;
     if funders.is_empty() || total_funded <= 0 {
-        transfer(env, &c.token, &this, &c.client, refund);
+        transfer_checked(env, &c.token, &this, &c.client, refund)?;
         return Ok(());
     }
     let mut remaining = refund;
@@ -1110,7 +1152,7 @@ fn refund_funders(env: &Env, c: &EscrowContract, refund: i128) -> Result<(), Esc
             .ok_or(EscrowError::ArithmeticOverflow)?
             / total_funded;
         if share > 0 {
-            transfer(env, &c.token, &this, &funder, share);
+            transfer_checked(env, &c.token, &this, &funder, share)?;
             remaining = remaining
                 .checked_sub(share)
                 .ok_or(EscrowError::ArithmeticOverflow)?;
@@ -1122,7 +1164,7 @@ fn refund_funders(env: &Env, c: &EscrowContract, refund: i128) -> Result<(), Esc
     }
     if remaining > 0 {
         let to = largest.unwrap_or_else(|| c.client.clone());
-        transfer(env, &c.token, &this, &to, remaining);
+        transfer_checked(env, &c.token, &this, &to, remaining)?;
     }
     Ok(())
 }
@@ -1244,7 +1286,7 @@ impl Escrow {
         if surplus <= 0 {
             return Err(EscrowError::NoSurplus);
         }
-        token_client.transfer(&this, &to, &surplus);
+        transfer_checked(&env, &token, &this, &to, surplus)?;
         env.events()
             .publish((symbol_short!("sweep"), token), (to, surplus));
         Ok(surplus)
@@ -1563,7 +1605,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < remaining {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, remaining);
+        pay_out(&env, &c, remaining)?;
         m.released = true;
         c.released_amount = c
             .released_amount
@@ -1646,7 +1688,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < remaining {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, remaining);
+        pay_out(&env, &c, remaining)?;
         m.released = true;
         c.released_amount = c
             .released_amount
@@ -1703,7 +1745,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < amount {
             return Err(EscrowError::InsufficientFunds);
         }
-        pay_out(&env, &c, amount);
+        pay_out(&env, &c, amount)?;
         c.released_amount = c
             .released_amount
             .checked_add(amount)
@@ -1810,7 +1852,7 @@ impl Escrow {
             return Err(EscrowError::InsufficientFunds);
         }
 
-        pay_out(&env, &c, total);
+        pay_out(&env, &c, total)?;
         for (pos, index) in indices.iter().enumerate() {
             let mut m = c.milestones.get(index).unwrap();
             m.released = true;
@@ -1866,7 +1908,7 @@ impl Escrow {
         }
 
         // Direct client -> freelancer transfer; escrow balance is untouched.
-        transfer(&env, &c.token, &c.client, &payee(&env, &c), amount);
+        transfer_checked(&env, &c.token, &c.client, &payee(&env, &c), amount)?;
 
         // Cumulative per-escrow bonus.
         let bonus_key = DataKey::Bonus(id);
@@ -1929,7 +1971,7 @@ impl Escrow {
         }
         // The opener posts a refundable bond before the status changes.
         let bond = dispute_bond(c.total_amount);
-        transfer(&env, &c.token, &caller, &env.current_contract_address(), bond);
+        transfer_checked(&env, &c.token, &caller, &env.current_contract_address(), bond)?;
         let bond_key = DataKey::DisputeBond(id);
         env.storage()
             .persistent()
